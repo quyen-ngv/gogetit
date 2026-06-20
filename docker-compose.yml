@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    image: luxofons/google-maps-bot:latest
+    container_name: google-maps-telegram-bot
+    restart: unless-stopped
+    
+    environment:
+      - TELEGRAM_BOT_TOKEN=8565880065:AAFKHNi5tBhwkY5zYOaOuCWaGOuMMzHxMCE
+      - TELEGRAM_USER_ID=5636346689
+    
+    volumes:
+      # Mount logs directory
+      - ./logs:/app/logs
+      # Optional: mount output files
+      - ./output:/app/output
+    
+    # Resource limits
+    mem_limit: 2g
+    cpus: 1.5
+    
+    # Restart policy
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

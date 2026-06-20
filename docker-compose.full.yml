@@ -1,0 +1,201 @@
+services:
+  vocaberry-db:
+    image: postgres:15-alpine
+    container_name: vocaberry-db
+    restart: always
+    environment:
+      POSTGRES_DB: vocaberry_db
+      POSTGRES_USER: vocaberry
+      POSTGRES_PASSWORD: vocaberry_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - vocaberry_db_data:/var/lib/postgresql/data
+    networks:
+      - vocaberry-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vocaberry -d vocaberry_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # GoRoute Database (separate from vocaberry)
+  goroute-db:
+    image: postgres:15-alpine
+    container_name: goroute-db
+    restart: always
+    environment:
+      POSTGRES_DB: goroute
+      POSTGRES_USER: goroute
+      POSTGRES_PASSWORD: goroute123
+    ports:
+      - "5433:5432"  # Different port to avoid conflict
+    volumes:
+      - goroute_db_data:/var/lib/postgresql/data
+    networks:
+      - vocaberry-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U goroute -d goroute"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  vocaberry-app:
+    image: luxofons/vocaberry:0.0.94
+    container_name: vocaberry-app
+    restart: always
+    user: "0:0"
+    expose:
+      - "8080"
+    env_file:
+      - .env
+    volumes:
+      - vocaberry_lucene_data:/app/data
+      - ./data:/app/data
+      - ./cookies.txt:/app/cookies.txt
+      - ./credentials.json:/app/credentials.json:ro
+    depends_on:
+      vocaberry-db:
+        condition: service_healthy
+    networks:
+      - vocaberry-network
+
+  # GoRoute App
+  goroute-app:
+    image: luxofons/goroute:v0.1.68
+    container_name: goroute-app
+    restart: always
+    expose:
+      - "8080"
+    env_file:
+      - .env
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - DB_URL=jdbc:postgresql://goroute-db:5432/goroute
+      - DB_USERNAME=goroute
+      - DB_PASSWORD=goroute123
+      - JWT_SECRET=${GOROUTE_JWT_SECRET:-404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}
+      - FIREBASE_CREDENTIAL_PATH=file:/app/goroute-credentials.json
+    volumes:
+      - ./goroute-credentials.json:/app/goroute-credentials.json:ro
+    depends_on:
+      goroute-db:
+        condition: service_healthy
+    networks:
+      - vocaberry-network
+
+  # Google Maps Telegram Bot (NEW)
+  google-maps-bot:
+    image: luxofons/google-maps-bot:latest
+    container_name: google-maps-telegram-bot
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=8565880065:AAFKHNi5tBhwkY5zYOaOuCWaGOuMMzHxMCE
+      - TELEGRAM_USER_ID=5636346689
+    volumes:
+      - ./python_place_reviews_job/logs:/app/logs
+      - ./python_place_reviews_job/output:/app/output
+    mem_limit: 2g
+    cpus: 1.5
+    networks:
+      - vocaberry-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  cambridge-dictionary:
+    image: luxofons/dict:v0.0.4
+    container_name: cambridge-dictionary-api
+    restart: always
+    expose:
+      - "3006"
+    environment:
+      - PORT=3005
+      - NODE_ENV=production
+    networks:
+      - vocaberry-network
+
+  minio:
+    image: minio/minio:latest
+    container_name: vocaberry-minio
+    restart: always
+    volumes:
+      - minio_data:/data
+    env_file:
+      - .env
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_SERVER_URL: https://onestudy.id.vn/resource
+    expose:
+      - "9000"
+    networks:
+      - vocaberry-network
+    command: server /data --console-address ":9001"
+
+  # Image Compression Service
+  imgpress:
+    image: luxofons/imgpress:v0.1.0
+    container_name: imgpress
+    restart: always
+    expose:
+      - "3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - MAX_FILE_SIZE_MB=50
+      - DEFAULT_QUALITY=80
+      - DEFAULT_WIDTH=1600
+      - COMPRESS_TIMEOUT_MS=300000
+    networks:
+      - vocaberry-network
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  nginx:
+    image: nginx:alpine
+    container_name: vocaberry-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    depends_on:
+      - vocaberry-app
+    networks:
+      - vocaberry-network
+    command: "/bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g \"daemon off;\"'"
+
+  certbot:
+    image: certbot/certbot
+    container_name: vocaberry-certbot
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+volumes:
+  vocaberry_db_data:
+  vocaberry_lucene_data:
+  goroute_db_data:
+  minio_data:
+
+networks:
+  vocaberry-network:
+    driver: bridge

@@ -1,0 +1,231 @@
+{
+  "generated_at": "2026-06-20T01:51:42.192307+00:00",
+  "count": 1,
+  "places": [
+    {
+      "input_url": "https://maps.app.goo.gl/sDYjZmQiJAcu5qnu6",
+      "resolved_url": "https://www.google.com/maps/place/Ph%E1%BB%9F+Mai/@21.028191,105.8495047,17z/data=!3m1!4b1!4m6!3m5!1s0x3135ab8c16b306b3:0x27808bd3876365a2!8m2!3d21.028191!4d105.8495047!16s%2Fg%2F11v6ct9mgr?entry=ttu&g_ep=EgoyMDI2MDYxNi4wIKXMDSoASAFQAw%3D%3D",
+      "place_id": "ChIJswazFoyrNTERomVjh9OLgCc",
+      "placeId": "ChIJswazFoyrNTERomVjh9OLgCc",
+      "cid": "",
+      "dataId": "",
+      "link": "https://www.google.com/maps/place/Ph%E1%BB%9F+Mai/@21.028191,105.8495047,17z/data=!3m1!4b1!4m6!3m5!1s0x3135ab8c16b306b3:0x27808bd3876365a2!8m2!3d21.028191!4d105.8495047!16s%2Fg%2F11v6ct9mgr?entry=ttu&g_ep=EgoyMDI2MDYxNi4wIKXMDSoASAFQAw%3D%3D",
+      "googleMapsLink": "https://www.google.com/maps/place/Ph%E1%BB%9F+Mai/@21.028191,105.8495047,17z/data=!3m1!4b1!4m6!3m5!1s0x3135ab8c16b306b3:0x27808bd3876365a2!8m2!3d21.028191!4d105.8495047!16s%2Fg%2F11v6ct9mgr?entry=ttu&g_ep=EgoyMDI2MDYxNi4wIKXMDSoASAFQAw%3D%3D",
+      "title": "Phở Mai",
+      "name": "Phở Mai",
+      "category": "Family restaurant",
+      "placeGroup": "FOOD_AND_DRINK",
+      "categories": [
+        "Family restaurant"
+      ],
+      "address": "Address: 40 P. Nhà Chung, Hoàn Kiếm, Hà Nội, Vietnam",
+      "destinations": [
+        "hanoi"
+      ],
+      "phone": "Send to phone",
+      "website": "",
+      "webSite": "",
+      "plusCode": "Plus code: 2RHX+7R Hoan Kiem, Ha Noi, Vietnam",
+      "plus_code": "Plus code: 2RHX+7R Hoan Kiem, Ha Noi, Vietnam",
+      "timezone": "Asia/Saigon",
+      "reviewRating": 4.3,
+      "review_rating": 4.3,
+      "reviewCount": 130,
+      "review_count": 130,
+      "reviewsPerRating": {
+        "1": 9,
+        "2": 2,
+        "3": 12,
+        "4": 30,
+        "5": 77
+      },
+      "reviews_per_rating": {
+        "1": 9,
+        "2": 2,
+        "3": 12,
+        "4": 30,
+        "5": 77
+      },
+      "latitude": 21.028191,
+      "longitude": 105.8495047,
+      "longtitude": 105.8495047,
+      "status": "ok",
+      "description": "",
+      "descriptions": "",
+      "thumbnail": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHBx4JzgQvuUJZsWr40Sx611lwAOfUZTJ7xLfHcFVehDIQAQKz73mz3HZl8PnAK3PUQ0QLp7eQMUN4eIuQAmFcmNZokZbXau7nzzQj_UVlKySwJ0aSEj0qPx93NEQg2iCBRQSbCj4NuMjY=w4080-h5440-k-no",
+      "priceRange": "·₫1–100,000",
+      "price_range": "·₫1–100,000",
+      "images": [
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAEk2cd_Mk61qmb2t_P6ovSF4euOReEqM_beS2dgF36xkeUgo4hShJ7CYaQiZ0f3V5aDIghUnC4Bn7PRwk9bRRWPvsMyMPosdag13BvR4TX4bs7eOACQFwk8rtVB70ILrt6kUxU=w1120-h1120-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAEMWIyTpAsMfz8O47XpYDtcVoRvoXkIwC6yxcC6q_Kwx8xtS2c-KD3FdYm4IzURRs7qKmWwrHkwdOoTQLJykUKliiQlCuKtcOsdKjLk3fIAZtV_vrxlef_O8S1fRPrHuerR1YzQ=w1120-h1120-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHD8O5i6rUwBrAmCcUqbmU-IQiXh-DNfWjZvU4Lk1UGVdnRz7lKU_km3Q9HCV6Zwsohtrc68vnkIgHt7-ImP4Pg7Z9us1KN98bsAuvNu4YsvKBzkD-r2ioI2y5RKQ3MqHV5PTKjTw=w1120-h1120-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHzmbL-6ure6AT3LoSYpKWo8AOjFEwAtoGh6GtJzDagHc_mGtrp7LdZ5UiZRIaKEDnOOn04P608H6iSEli2eAefowzMLdW3ODf6vZzxyryHSP3oBmgjfxQrEAAeMLCEMMWhmt4YA84pk0qr=w2240-h3980-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHitaAMoe07XLFM1Jr1GCGx7MNoWTrrhid3SeAV4_MzhpTu7uuW1ewBfqWaYp3XTuUC_futR1FI9hBlZysghH4fEk7Y_7Vtub5KxDlLAdgNZ1Rtb9Wo6oh1LJpnRnJg9V5q2mfzuxdvRlI=w2240-h2980-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHFJn2qku6ri7SuADY8xaqULQ-GS-ebzMixbcOhZqVNVuhoi3sLC0Q4KHplMcpW58EO8IwDn8ZJLh_uz3tYD6WBLC6LKwkgrHlXno7XfzuSh9Ex4IEBMNxJqobw0D5NmPFuG5pupQxprSUt=w3970-h2980-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAH-xgQv0hSID1RYJESAB3H5gWIPqJUqrrJrFX8lv2SjEzE88T_xowg8A6kkeAlGYxoFAz25iN5zhHxTRX2_otvOUdWBNj22tBu03tIBsHzmGOFrKYASL1seL6IShnkLCu7_DTtAcC9ByRR3=w5290-h2980-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAH7xIUJyUoPXNiMxKmRW-QFo-HYuuvVVfT0zmg57wTYLQB_8B5vs2QSoKsLs8koNXZzXG--2LMDecz-lahHN6RHdSnSanc1GUaFIt9kzPmNfS7WCIbhju0VyrHGElKVYRGZBopdXtsnCuNM=w1560-h1140-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAEYnGAEJsfJk_2gbdn1ekOwzyIx42YGu2lFxj466AsSFrBkBNhDU_JQYU-d8Vycf58-C5P2eq3Xxd9fNDm5OzPYeMNrVTfNMtsH8nH1fjK5GVhtxb_58-E6Pl-mFZoHEjAq1crl7ebt34Q5=w1560-h1140-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAHgePSqO3qokJLJ-skosPvZ-hegNHeb6CPQcIa8Ncwmi3Uz4mPovueD7UG4udl9M63jq9kSvSJTpLdWSyB0Iz9dgwMkTKIuj2x6gz_mwgkeQgZk3shZlaSRb-SfFVjuUPypIUdwFsbAxdLl=w1560-h1140-p-k-no",
+          "title": ""
+        },
+        {
+          "image": "https://lh3.googleusercontent.com/gps-cs-s/APNQkAGJIHs0tR7t716cRCM4yFcA8S8k0iqGuHpDl8A-hru-0ehP7pi758Ga-NmH9CAhHbIjV13V2xNFNgYvc-AywzXsH4gTVQ2mwH4ccFJx0MfgoSYOiAmocmQ90VQuFHMGzcpRalOW=w1560-h1140-p-k-no",
+          "title": ""
+        }
+      ],
+      "menu": {
+        "link": "",
+        "source": ""
+      },
+      "reservations": {
+        "available": false,
+        "link": "",
+        "text": ""
+      },
+      "orderOnline": {
+        "available": false,
+        "link": "",
+        "text": ""
+      },
+      "openHours": {},
+      "open_hours": {},
+      "popularTimes": {},
+      "popular_times": {},
+      "owner": {},
+      "completeAddress": {},
+      "complete_address": {},
+      "about": [],
+      "reviewsLink": "",
+      "reviews_link": "",
+      "emails": [],
+      "rawData": {},
+      "reviews": [
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT25GNFN6SXdVM1pZVlZwTmREWmtiR0kyUlZVNGMzYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Maika Dương",
+          "profileUrl": "https://www.google.com/maps/contrib/112441038141090378196/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a-/ALV-UjWNI5UTMZeVoAcW-bj19kDuGg7L3qhN_kLDTwF1TgPj_ttgoy4=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 2,
+          "totalPhotos": 0,
+          "rating": 5,
+          "description": "Delicious. FOMO was a success.",
+          "when": "4 days ago",
+          "images": [],
+          "likes": 0
+        },
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT2pGUmNtSk5ZWGxpZVcwNGNrZEtMVXczYlRCUWJtYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Ngoc Bich Nguyen",
+          "profileUrl": "https://www.google.com/maps/contrib/107587335519805865708/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a-/ALV-UjVc1Cd5Fbiu3ZTc4MaEjnGwp293JQ8emk9ZoIcCkmeAkHK_1n8m=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 2,
+          "totalPhotos": 4,
+          "rating": 5,
+          "description": "",
+          "when": "a week ago",
+          "images": [],
+          "likes": 0
+        },
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT2poMmIwTXhTbGhTV210bk5VNUVSa0ZSYTFjNVpuYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Quan Do",
+          "profileUrl": "https://www.google.com/maps/contrib/112201159435844605713/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a/ACg8ocIFgfzVaVdKcaL1mve0MRekigx0W1OBwMUESVTwwBjmdWAvQrg=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 5,
+          "totalPhotos": 4,
+          "rating": 5,
+          "description": "The owner is friendly to everyone, the food is delicious, the dipping sauce is amazing, the price is a little high but the quality is excellent 💯\nHighly recommend everyone to try it 🤩",
+          "when": "2 weeks ago",
+          "images": [
+            "https://lh3.googleusercontent.com/grass-cs/ANxoTn0rQkgsWAeo1cV3rIuhU3auIEpyn0AcmEyCP89GefdI1H-xPw6lZg1SX2IeeyXYxypv8B_t9VUw7rsh7dQJB507PnUPQWA0_rQfp6PWutAWPyjmQAiYtkxWwvHT4UwoDqRi2zcM7kPOMzLS=w6000-h4500-p-k-no"
+          ],
+          "likes": 0
+        }
+      ],
+      "userReviews": [
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT25GNFN6SXdVM1pZVlZwTmREWmtiR0kyUlZVNGMzYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Maika Dương",
+          "profileUrl": "https://www.google.com/maps/contrib/112441038141090378196/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a-/ALV-UjWNI5UTMZeVoAcW-bj19kDuGg7L3qhN_kLDTwF1TgPj_ttgoy4=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 2,
+          "totalPhotos": 0,
+          "rating": 5,
+          "description": "Delicious. FOMO was a success.",
+          "when": "4 days ago",
+          "images": [],
+          "likes": 0
+        },
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT2pGUmNtSk5ZWGxpZVcwNGNrZEtMVXczYlRCUWJtYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Ngoc Bich Nguyen",
+          "profileUrl": "https://www.google.com/maps/contrib/107587335519805865708/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a-/ALV-UjVc1Cd5Fbiu3ZTc4MaEjnGwp293JQ8emk9ZoIcCkmeAkHK_1n8m=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 2,
+          "totalPhotos": 4,
+          "rating": 5,
+          "description": "",
+          "when": "a week ago",
+          "images": [],
+          "likes": 0
+        },
+        {
+          "reviewId": "Ci9DQUlRQUNvZENodHljRjlvT2poMmIwTXhTbGhTV210bk5VNUVSa0ZSYTFjNVpuYxAB",
+          "googlePlaceId": "ChIJswazFoyrNTERomVjh9OLgCc",
+          "name": "Quan Do",
+          "profileUrl": "https://www.google.com/maps/contrib/112201159435844605713/reviews?hl=en",
+          "profilePicture": "https://lh3.googleusercontent.com/a/ACg8ocIFgfzVaVdKcaL1mve0MRekigx0W1OBwMUESVTwwBjmdWAvQrg=w360-h360-p-rp-mo-br100",
+          "isLocalGuide": false,
+          "totalReviews": 5,
+          "totalPhotos": 4,
+          "rating": 5,
+          "description": "The owner is friendly to everyone, the food is delicious, the dipping sauce is amazing, the price is a little high but the quality is excellent 💯\nHighly recommend everyone to try it 🤩",
+          "when": "2 weeks ago",
+          "images": [
+            "https://lh3.googleusercontent.com/grass-cs/ANxoTn0rQkgsWAeo1cV3rIuhU3auIEpyn0AcmEyCP89GefdI1H-xPw6lZg1SX2IeeyXYxypv8B_t9VUw7rsh7dQJB507PnUPQWA0_rQfp6PWutAWPyjmQAiYtkxWwvHT4UwoDqRi2zcM7kPOMzLS=w6000-h4500-p-k-no"
+          ],
+          "likes": 0
+        }
+      ],
+      "reviews_count_output": 3
+    }
+  ]
+}
