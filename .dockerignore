@@ -37,6 +37,7 @@ logs/
 # Output
 output/
 *.json
+!nationwide_search_config.json
 *.csv
 
 # OS

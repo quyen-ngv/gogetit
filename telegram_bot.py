@@ -10,7 +10,6 @@ Usage:
 """
 
 import logging
-import os
 import re
 import sys
 import time
@@ -24,8 +23,11 @@ except ImportError:
     print("Install with: pip install python-telegram-bot")
     sys.exit(1)
 
-from run_job import scrape_place, setup_logging
-from upload_to_api import format_place_for_api, upload_place as api_upload_place
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_USER_ID
+from place_pipeline import scrape_and_import
+from place_urls import extract_urls
+from run_job import setup_logging
+from run_job import DEFAULT_MAX_REVIEWS
 
 # Setup logging
 logging.basicConfig(
@@ -34,39 +36,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# API configuration
-API_URL = "https://onestudy.id.vn/goroute/v1/api/places/import"
-API_HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
 
-
-def is_google_maps_url(text: str) -> bool:
-    """Check if text contains a Google Maps URL."""
-    patterns = [
-        r'https?://(?:www\.)?google\.com/maps',
-        r'https?://maps\.google\.com',
-        r'https?://goo\.gl/maps',
-        r'https?://maps\.app\.goo\.gl',
-    ]
-    return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
-
-
-def extract_urls(text: str) -> list[str]:
-    """Extract all Google Maps URLs from text."""
-    urls = []
-    # Find all URLs in text
-    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
-    found_urls = re.findall(url_pattern, text)
-    
-    for url in found_urls:
-        if is_google_maps_url(url):
-            urls.append(url)
-    
-    return urls
-
+def _requested_max_reviews(text: str) -> int:
+    match = re.search(r"(?:max[_\s-]?reviews?|reviews?|/r)\s*[:=]?\s*(\d{1,3})", text or "", re.IGNORECASE)
+    if not match:
+        return DEFAULT_MAX_REVIEWS
+    value = int(match.group(1))
+    return max(1, min(value, DEFAULT_MAX_REVIEWS))
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message."""
@@ -98,8 +74,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
     
     # Check if user is allowed
-    allowed_user_id = int(os.getenv("TELEGRAM_USER_ID", "5636346689"))
-    if user.id != allowed_user_id:
+    if user.id != TELEGRAM_USER_ID:
         logger.warning(f"Unauthorized user attempted to use bot: {user.id} ({user.username})")
         await update.message.reply_text(
             "❌ Bạn không có quyền sử dụng bot này."
@@ -107,6 +82,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     logger.info(f"Received message from {user.username or user.id}: {text[:100]}")
+    max_reviews = _requested_max_reviews(text)
     
     # Extract URLs
     urls = extract_urls(text)
@@ -130,58 +106,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"{prefix}⏳ Đang xử lý URL...\n{url}")
         
         try:
-            # Step 1: Scrape place
             status_msg = await update.message.reply_text(
                 f"{prefix}📡 Đang lấy thông tin từ Google Maps..."
             )
-            
-            place_data = scrape_place(
-                url,
-                headless=True,
-                max_reviews=500,  # Get up to 500 reviews (sorted by newest)
-                max_scrolls=100  # Increase scrolls to get more reviews
-            )
-            
-            if place_data.get("status") == "failed":
+
+            result = scrape_and_import(url, headless=True, max_reviews=max_reviews, max_scrolls=100)
+
+            if result.scrape_error:
                 await status_msg.edit_text(
-                    f"{prefix}❌ Lỗi khi scrape:\n{place_data.get('error', 'Unknown error')}"
+                    f"{prefix}❌ Lỗi khi scrape:\n{result.scrape_error}"
                 )
                 continue
-            
-            place_title = place_data.get("title", "Unknown")
-            review_count = place_data.get("reviews_count_output", 0)
-            
+
+            place = result.place
+            place_title = place.title if place else "Unknown"
+            review_count = place.reviews_scraped if place else 0
+            review_rating = place.review_rating if place else 0
+            place_id = place.place_id if place else "N/A"
+
             await status_msg.edit_text(
                 f"{prefix}✅ Đã lấy thông tin:\n"
                 f"📍 {place_title}\n"
-                f"⭐ {place_data.get('reviewRating', 0)}/5\n"
+                f"⭐ {review_rating}/5\n"
                 f"💬 {review_count} reviews"
             )
-            
-            # Step 2: Upload to API
+
             upload_msg = await update.message.reply_text(
                 f"{prefix}☁️ Đang upload lên API..."
             )
-            
-            try:
-                api_data = format_place_for_api(place_data)
-                success = api_upload_place(API_URL, api_data, API_HEADERS)
-                
-                if success:
-                    await upload_msg.edit_text(
-                        f"{prefix}✅ Upload thành công!\n\n"
-                        f"📍 {place_title}\n"
-                        f"🆔 {place_data.get('placeId', 'N/A')}\n"
-                        f"⭐ {place_data.get('reviewRating', 0)}/5 ({review_count} reviews)"
-                    )
-                else:
-                    await upload_msg.edit_text(
-                        f"{prefix}❌ Upload thất bại\n"
-                        f"Place: {place_title}"
-                    )
-            except Exception as e:
+
+            if result.success:
                 await upload_msg.edit_text(
-                    f"{prefix}❌ Lỗi upload: {str(e)[:100]}"
+                    f"{prefix}✅ Upload thành công!\n\n"
+                    f"📍 {place_title}\n"
+                    f"🆔 {place_id}\n"
+                    f"⭐ {review_rating}/5 ({review_count} reviews)"
+                )
+            else:
+                upload_error = result.upload_error or "Unknown error"
+                await upload_msg.edit_text(
+                    f"{prefix}❌ Upload thất bại\n"
+                    f"Place: {place_title}\n"
+                    f"Lỗi: {upload_error[:100]}"
                 )
             
             # Delay between URLs
@@ -207,13 +173,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     """Run the bot."""
     # Get token from environment or use default
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "8565880065:AAFKHNi5tBhwkY5zYOaOuCWaGOuMMzHxMCE")
-    
-    # Allowed user ID (for security - only this user can use bot)
-    allowed_user_id = int(os.getenv("TELEGRAM_USER_ID", "5636346689"))
-    
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not set")
+        return 1
+
     logger.info("Starting Telegram bot...")
-    logger.info(f"Allowed user ID: {allowed_user_id}")
+    logger.info(f"Allowed user ID: {TELEGRAM_USER_ID}")
     
     # Setup run_job logging to file only
     setup_logging("WARNING", "bot_scraper.log")
@@ -221,7 +186,7 @@ def main():
     logger.info("Starting Telegram bot...")
     
     # Create application
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Register handlers
     app.add_handler(CommandHandler("start", start))

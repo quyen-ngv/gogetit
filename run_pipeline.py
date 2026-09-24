@@ -13,16 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-from run_job import scrape_place, setup_logging, read_urls
+from config import GOROUTE_API_HEADERS, GOROUTE_API_URL
+from run_job import scrape_place, setup_logging, read_urls, DEFAULT_MAX_REVIEWS
 from upload_to_api import format_place_for_api, upload_place
-
-# API configuration
-API_URL = "https://onestudy.id.vn/goroute/v1/api/places/import"
-API_HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,7 +28,12 @@ def main(argv: list[str] | None = None) -> int:
     
     # Scraping options
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
-    parser.add_argument("--max-reviews", type=int, default=50, help="Max reviews per place")
+    parser.add_argument(
+        "--max-reviews",
+        type=int,
+        default=DEFAULT_MAX_REVIEWS,
+        help=f"Max reviews returned per place (cap {DEFAULT_MAX_REVIEWS})",
+    )
     parser.add_argument("--max-scrolls", type=int, default=30, help="Max scrolls for reviews")
     
     # Other options
@@ -101,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         print("☁️  Uploading to API...")
         try:
             api_data = format_place_for_api(place_data)
-            upload_success = upload_place(API_URL, api_data, API_HEADERS)
+            upload_success = upload_place(GOROUTE_API_URL, api_data, GOROUTE_API_HEADERS)
             
             if upload_success:
                 print(f"✅ Upload successful")

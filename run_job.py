@@ -9,22 +9,36 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
 try:
     from seleniumbase import Driver
-    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+    from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
+    from selenium.webdriver.common.action_chains import ActionChains
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.webdriver.support.ui import WebDriverWait
 except ImportError as exc:  # pragma: no cover - environment error
     raise SystemExit(
         "Missing dependency. Install with: pip install -r requirements.txt"
     ) from exc
+
+from browser_runtime import acquire_browser_slot, release_browser_slot
+from config import (
+    PLACE_BROWSER_COMMAND_TIMEOUT_SECONDS,
+    PLACE_BROWSER_BLOCK_IMAGES,
+    PLACE_BROWSER_BLOCK_NONESSENTIAL,
+    PLACE_BROWSER_PAGE_LOAD_STRATEGY,
+    PLACE_REVIEW_NO_IMAGE_SCROLL_LIMIT,
+    PLACE_REVIEW_SCRAPE_TIMEOUT_SECONDS,
+)
 
 
 REVIEW_WORDS = {
@@ -40,7 +54,13 @@ COOKIE_BUTTON = (
 )
 
 REVIEW_CARD = "div[data-review-id]"
+DEFAULT_MAX_REVIEWS = 50
+MAX_REVIEW_COLLECTION_LIMIT = 200
 LOG = logging.getLogger("place_reviews_job")
+
+
+class GoogleBlockedError(RuntimeError):
+    """Google served its bot-check ("unusual traffic") page instead of a place."""
 
 # Vietnam destinations mapping
 VIETNAM_DESTINATIONS = {
@@ -178,6 +198,47 @@ class Review:
     reviewer_is_local_guide: bool = False
     reviewer_total_reviews: int = 0
     reviewer_total_photos: int = 0
+    authenticity_score: float = 0.0
+
+
+def calculate_authenticity_score(review: Review | dict[str, Any]) -> float:
+    """Calculate review reliability score in the range 0..1."""
+    if isinstance(review, Review):
+        text = review.text or ""
+        photos = review.photos or []
+        total_reviews = review.reviewer_total_reviews or 0
+        total_photos = review.reviewer_total_photos or 0
+        is_local_guide = review.reviewer_is_local_guide
+    else:
+        text = str(review.get("text") or review.get("description") or "")
+        photos = review.get("photos") or review.get("images") or []
+        total_reviews = first_int(
+            str(review.get("reviewer_total_reviews") or review.get("totalReviews") or 0)
+        ) or 0
+        total_photos = first_int(
+            str(review.get("reviewer_total_photos") or review.get("totalPhotos") or 0)
+        ) or 0
+        is_local_guide = bool(review.get("reviewer_is_local_guide") or review.get("isLocalGuide"))
+
+    trimmed_text = text.strip()
+    has_text = 1.0 if trimmed_text else 0.0
+    text_length_score = min(len(trimmed_text) / 200, 1.0)
+    has_photos = 1.0 if photos else 0.0
+
+    reviewer_reviews_score = min(max(total_reviews, 0) / 50, 1.0)
+    reviewer_photos_score = min(max(total_photos, 0) / 100, 1.0)
+    local_guide_score = 1.0 if is_local_guide else 0.0
+    reviewer_credibility = (
+        reviewer_reviews_score + reviewer_photos_score + local_guide_score
+    ) / 3
+
+    score = (
+        0.15 * has_text
+        + 0.25 * text_length_score
+        + 0.25 * has_photos
+        + 0.35 * reviewer_credibility
+    )
+    return round(max(0.0, min(score, 1.0)), 4)
 
 
 def upscale_image_url(url: str, scale: int = 10) -> str:
@@ -342,9 +403,64 @@ def extract_place_id(original_url: str, resolved_url: str) -> str:
     return f"url:{abs(hash(resolved_url or original_url))}"
 
 
+def extract_data_id(*urls: str) -> str:
+    """Extract Google's stable hex data id (0x...:0x...) from a Maps URL."""
+    for url in urls:
+        match = re.search(r"!1s(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)", url or "")
+        if match:
+            return match.group(1)
+    return ""
+
+
+def strip_google_info_prefix(value: str, *prefixes: str) -> str:
+    """Remove accessibility prefixes such as 'Address:' without damaging content."""
+    cleaned = re.sub(r"\s+", " ", str(value or "")).strip()
+    for prefix in prefixes:
+        cleaned = re.sub(rf"^{re.escape(prefix)}\s*:?\s*", "", cleaned, flags=re.I)
+    return cleaned.strip()
+
+
+def normalize_place_information(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize values read from Google Maps' information/action regions."""
+    normalized = dict(raw)
+    normalized["address"] = strip_google_info_prefix(raw.get("address", ""), "Address", "Địa chỉ")
+    normalized["phone"] = strip_google_info_prefix(raw.get("phone", ""), "Phone", "Điện thoại")
+    if normalized["phone"].lower() in {"send to phone", "call", "call phone number", "copy phone number"}:
+        normalized["phone"] = ""
+    normalized["plusCode"] = strip_google_info_prefix(raw.get("plusCode", ""), "Plus code")
+    normalized["priceRange"] = strip_google_info_prefix(raw.get("priceRange", ""), "Price range")
+    normalized["priceRange"] = re.split(
+        r",?\s*Reported by\b",
+        normalized["priceRange"],
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ·,")
+    normalized["currentOpenStatus"] = strip_google_info_prefix(
+        raw.get("currentOpenStatus", ""),
+        "Hours",
+    )
+    normalized["currentOpenStatus"] = re.sub(
+        r"\s*Show open hours for the week\s*$",
+        "",
+        normalized["currentOpenStatus"],
+        flags=re.I,
+    ).strip()
+    raw_status = re.sub(r"\s+", " ", str(raw.get("status") or "")).strip()
+    if not normalized["currentOpenStatus"] and raw_status:
+        normalized["currentOpenStatus"] = raw_status
+    normalized["status"] = (
+        raw_status
+        if re.search(r"\b(?:permanently|temporarily) closed\b", raw_status, re.I)
+        else ""
+    )
+    return normalized
+
+
 def setup_driver(headless: bool):
     LOG.info("Starting browser: headless=%s", headless)
-    
+
+    acquire_browser_slot()
+    driver = None
     # Check if running in WSL and set Chrome path
     import os
     chrome_binary = None
@@ -356,17 +472,69 @@ def setup_driver(headless: bool):
     driver_kwargs = {
         'uc': True,
         'headless': headless,
-        'page_load_strategy': 'normal',
+        'page_load_strategy': (
+            PLACE_BROWSER_PAGE_LOAD_STRATEGY
+            if PLACE_BROWSER_PAGE_LOAD_STRATEGY in {'normal', 'eager', 'none'}
+            else 'eager'
+        ),
         'incognito': True,
+        'locale_code': 'en-US',
+        'no_sandbox': True,
+        'disable_gpu': True,
+        'block_images': PLACE_BROWSER_BLOCK_IMAGES,
+        'chromium_arg': (
+            '--disable-background-networking,--disable-breakpad,'
+            '--disable-component-update,--disable-sync,--metrics-recording-only,'
+            '--no-first-run,--renderer-process-limit=3'
+        ),
     }
     
     if chrome_binary:
         LOG.info(f"Using Chrome from Windows: {chrome_binary}")
         driver_kwargs['binary_location'] = chrome_binary
     
-    driver = Driver(**driver_kwargs)
-    driver.set_page_load_timeout(45)
-    driver.set_window_size(1400, 900)
+    try:
+        driver = Driver(**driver_kwargs)
+    except Exception:
+        release_browser_slot()
+        raise
+    setattr(driver, "goroute_browser_slot_acquired", True)
+    try:
+        command_executor = getattr(driver, "command_executor", None)
+        client_config = getattr(command_executor, "_client_config", None)
+        if client_config is not None:
+            client_config.timeout = PLACE_BROWSER_COMMAND_TIMEOUT_SECONDS
+        elif command_executor is not None and hasattr(command_executor, "set_timeout"):
+            command_executor.set_timeout(PLACE_BROWSER_COMMAND_TIMEOUT_SECONDS)
+        driver.set_page_load_timeout(45)
+        driver.set_window_size(1400, 900)
+    except Exception:
+        close_driver(driver)
+        raise
+
+    if PLACE_BROWSER_BLOCK_NONESSENTIAL:
+        try:
+            driver.execute_cdp_cmd("Network.enable", {})
+            driver.execute_cdp_cmd(
+                "Network.setBlockedURLs",
+                {
+                    "urls": [
+                        "*.woff",
+                        "*.woff2",
+                        "*.ttf",
+                        "*.mp3",
+                        "*.mp4",
+                        "*.m4a",
+                        "*.webm",
+                        "*.avi",
+                        "*.mov",
+                        "*doubleclick.net/*",
+                        "*google-analytics.com/*",
+                    ]
+                },
+            )
+        except Exception as exc:
+            LOG.debug("Could not block nonessential browser resources: %s", exc)
     
     # Add stealth settings to avoid detection
     try:
@@ -383,6 +551,19 @@ def setup_driver(headless: bool):
     
     LOG.info("Browser started")
     return driver
+
+
+def close_driver(driver) -> None:
+    """Close Chrome and always return its process-wide capacity slot."""
+    slot_acquired = bool(getattr(driver, "goroute_browser_slot_acquired", False))
+    try:
+        driver.quit()
+    finally:
+        if slot_acquired:
+            try:
+                setattr(driver, "goroute_browser_slot_acquired", False)
+            finally:
+                release_browser_slot()
 
 
 def dismiss_cookies(driver) -> None:
@@ -407,18 +588,41 @@ def dismiss_cookies(driver) -> None:
         return
 
 
+def google_maps_english_url(url: str) -> str:
+    """Force Google Maps content to English while preserving the place URL."""
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower()
+    if "google." not in host and host != "maps.app.goo.gl":
+        return url
+    params = [(key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True) if key.lower() != "hl"]
+    params.append(("hl", "en"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(params, doseq=True), parsed.fragment))
+
+
 def navigate(driver, url: str) -> str:
-    LOG.info("Warming up Google session")
-    driver.get("https://www.google.com")
-    time.sleep(1.5)
-    dismiss_cookies(driver)
+    setattr(driver, "goroute_limited_view", False)
+    session_ready = bool(getattr(driver, "goroute_google_session_ready", False))
+    if not session_ready:
+        LOG.info("Warming up Google session")
+        driver.get("https://www.google.com/?hl=en")
+        time.sleep(1.5)
+        dismiss_cookies(driver)
+    url = google_maps_english_url(url)
     LOG.info("Navigating to place URL: %s", url)
     driver.get(url)
     time.sleep(5)
-    dismiss_cookies(driver)
+    if not session_ready:
+        dismiss_cookies(driver)
+        setattr(driver, "goroute_google_session_ready", True)
     resolved_url = driver.current_url
     LOG.info("Resolved URL: %s", resolved_url)
-    
+
+    if urlsplit(resolved_url).path.startswith("/sorry/"):
+        # Google's bot-check interstitial: no place ever loaded, and every subsequent
+        # request on this IP will hit the same wall until traffic stops for a while.
+        # Don't let the caller mistake this for one place failing.
+        raise GoogleBlockedError(f"Google served a bot-check page instead of the place: {resolved_url}")
+
     # Check for limited view warning (non-logged in users)
     try:
         body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
@@ -429,6 +633,7 @@ def navigate(driver, url: str) -> str:
         ]
         if any(signal in body_text for signal in limited_view_signals):
             LOG.warning("Google Maps showing limited view - reviews may be unavailable")
+            setattr(driver, "goroute_limited_view", True)
     except Exception:
         pass
     
@@ -555,15 +760,791 @@ def apply_rating_summary(
                 place["review_count"] = total
 
 
+DAY_NAMES = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+
+def parse_open_hours_copy_label(label: str) -> tuple[str, list[str]] | None:
+    """Parse Google Maps' accessible copy-hours label into the legacy API shape."""
+    cleaned = re.sub(r"\s+", " ", str(label or "")).strip()
+    match = re.match(
+        rf"^({'|'.join(DAY_NAMES)})\s*,\s*(.*?)\s*,\s*Copy (?:open|business) hours$",
+        cleaned,
+        re.I,
+    )
+    if not match:
+        return None
+
+    day = next((name for name in DAY_NAMES if name.lower() == match.group(1).lower()), match.group(1))
+    value = match.group(2).strip()
+    if not value:
+        return day, []
+
+    ranges = [part.strip() for part in value.split(",") if part.strip()]
+    normalized = [re.sub(r"\s+to\s+", " - ", item, flags=re.I) for item in ranges]
+    return day, normalized
+
+
+def parse_open_hours_cells(cells: list[str]) -> tuple[str, list[str]] | None:
+    """Parse a Google Maps hours table row represented as visible cell text."""
+    values = [re.sub(r"\s+", " ", str(cell or "")).strip() for cell in cells]
+    values = [value for value in values if value]
+    if not values:
+        return None
+    day = next((name for name in DAY_NAMES if name.lower() == values[0].lower()), None)
+    if not day:
+        return None
+    ranges: list[str] = []
+    for value in values[1:]:
+        if value.lower() in {"copy open hours", "copy business hours"}:
+            continue
+        ranges.extend(part.strip() for part in value.split(",") if part.strip())
+    return day, ranges
+
+
+def parse_popular_time_label(label: str) -> tuple[str, int] | None:
+    """Parse labels such as '65% busy at 12 PM.' into hour/percentage."""
+    cleaned = str(label or "").replace("\u202f", " ").strip()
+    match = re.search(r"(\d{1,3})%\s+busy\s+at\s+(.+?)[.]?$", cleaned, re.I)
+    if not match:
+        return None
+
+    percentage = max(0, min(int(match.group(1)), 100))
+    time_text = re.sub(r"\s+", " ", match.group(2)).strip().upper()
+    hour: int | None = None
+    for fmt in ("%I %p", "%I:%M %p", "%H:%M", "%H"):
+        try:
+            hour = datetime.strptime(time_text, fmt).hour
+            break
+        except ValueError:
+            continue
+    if hour is None:
+        return None
+    return str(hour), percentage
+
+
+def normalize_about_option(label: str, visible_text: str = "") -> dict[str, Any] | None:
+    """Convert an About-tab accessibility label to PlaceAboutOption shape."""
+    aria_label = re.sub(r"\s+", " ", str(label or "")).strip()
+    text = re.sub(r"\s+", " ", str(visible_text or "")).strip()
+    if not aria_label and not text:
+        return None
+
+    negative = bool(
+        re.match(
+            r"^(?:does not have|doesn't have|does not offer|no|not|is not)\b",
+            aria_label,
+            re.I,
+        )
+    )
+    name = text or re.sub(
+        r"^(?:does not have|doesn't have|does not offer|no|not|is not)\s+",
+        "",
+        aria_label,
+        flags=re.I,
+    )
+    name = re.sub(r"^[\ue000-\uf8ff\s·]+", "", name).strip(" ·")
+    if not name:
+        return None
+    return {"name": name, "enabled": not negative}
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(value or "").lower()).strip("_")
+    return slug or "other"
+
+
+def _scroll_main_panel(
+    driver,
+    *,
+    target_selector: str | None = None,
+    max_steps: int = 8,
+) -> bool:
+    """Trigger lazy Google Maps sections inside the place-detail scroll pane."""
+    for _ in range(max_steps):
+        if target_selector and driver.find_elements(By.CSS_SELECTOR, target_selector):
+            return True
+        moved = driver.execute_script(
+            """
+            const main = document.querySelector('main, [role="main"]') || document.body;
+            const candidates = [main, ...main.querySelectorAll('div')]
+              .filter((el) => el.scrollHeight > el.clientHeight + 80)
+              .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight));
+            const pane = candidates[0];
+            if (!pane) return false;
+            const before = pane.scrollTop;
+            pane.scrollTop = Math.min(pane.scrollTop + Math.max(pane.clientHeight * 0.8, 500), pane.scrollHeight);
+            return pane.scrollTop !== before;
+            """
+        )
+        if not moved:
+            break
+        time.sleep(0.4)
+    return bool(target_selector and driver.find_elements(By.CSS_SELECTOR, target_selector))
+
+
+def _read_popular_times_day(driver) -> tuple[str, dict[str, int], dict[str, Any]] | None:
+    payload = driver.execute_script(
+        r"""
+        const popularHeading = Array.from(document.querySelectorAll('h2')).find((el) =>
+          (el.textContent || '').trim().toLowerCase() === 'popular times'
+        );
+        const region = document.querySelector('[aria-label^="Popular times at"]')
+          || (popularHeading && popularHeading.closest('[role="region"]'))
+          || (popularHeading && popularHeading.parentElement && popularHeading.parentElement.parentElement)
+          || document;
+        const attr = (el, name) => (el && el.getAttribute(name) || '').trim();
+        const text = (el) => (el && el.textContent || '').replace(/\s+/g, ' ').trim();
+        const dayButton = Array.from(region.querySelectorAll('button')).find((el) =>
+          /^(Mondays|Tuesdays|Wednesdays|Thursdays|Fridays|Saturdays|Sundays)$/i.test(
+            attr(el, 'aria-label') || text(el)
+          )
+        );
+        const labels = Array.from(region.querySelectorAll('[aria-label]'))
+          .map((el) => attr(el, 'aria-label'))
+          .filter(Boolean);
+        return { day: attr(dayButton, 'aria-label') || text(dayButton), labels };
+        """
+    )
+    if not isinstance(payload, dict):
+        return None
+
+    raw_day = str(payload.get("day") or "").strip()
+    day = raw_day[:-1] if raw_day.lower().endswith("s") else raw_day
+    day = next((name for name in DAY_NAMES if name.lower() == day.lower()), day)
+    if day not in DAY_NAMES:
+        return None
+
+    hourly: dict[str, int] = {}
+    live: dict[str, Any] = {}
+    for label in payload.get("labels") or []:
+        parsed = parse_popular_time_label(str(label))
+        if parsed:
+            hour, percentage = parsed
+            hourly[hour] = percentage
+        live_match = re.search(r"currently\s+(\d{1,3})%\s+busy", str(label), re.I)
+        if live_match:
+            live["currentPercentage"] = max(0, min(int(live_match.group(1)), 100))
+            live["label"] = str(label)
+    return day, hourly, live
+
+
+def extract_popular_times(driver) -> tuple[dict[str, dict[str, int]], dict[str, Any]]:
+    """Collect the seven-day Popular times chart while it is visible on Overview."""
+    popular_times: dict[str, dict[str, int]] = {}
+    live_by_day: dict[str, Any] = {}
+    _scroll_main_panel(
+        driver,
+        target_selector='[aria-label^="Popular times at"]',
+        max_steps=10,
+    )
+
+    for _ in range(7):
+        current = _read_popular_times_day(driver)
+        if not current:
+            break
+        day, hourly, live = current
+        if day in popular_times:
+            break
+        popular_times[day] = hourly
+        if live:
+            live_by_day[day] = live
+
+        try:
+            clicked = driver.execute_script(
+                """
+                const heading = Array.from(document.querySelectorAll('h2')).find((el) =>
+                  (el.textContent || '').trim().toLowerCase() === 'popular times'
+                );
+                const region = document.querySelector('[aria-label^="Popular times at"]')
+                  || (heading && heading.closest('[role="region"]'))
+                  || (heading && heading.parentElement && heading.parentElement.parentElement)
+                  || document;
+                const button = region.querySelector('button[aria-label="Go to the next day"]');
+                if (!button) return false;
+                button.click();
+                return true;
+                """
+            )
+            if not clicked:
+                break
+            WebDriverWait(driver, 3).until(
+                lambda current_driver: (
+                    (_read_popular_times_day(current_driver) or (day, {}, {}))[0] != day
+                )
+            )
+        except Exception:
+            break
+
+    return popular_times, live_by_day
+
+
+def _extract_menu_tab_details(driver) -> dict[str, Any]:
+    """Load the Menu tab and read its photo carousel and highlighted dishes."""
+    region_selector = '[role="region"][aria-label="Menu"]'
+    carousel_selector = f'{region_selector} [aria-roledescription="carousel"]'
+    photo_selector = f'{carousel_selector} button[aria-label^="Photo "]'
+
+    try:
+        WebDriverWait(driver, 5).until(
+            lambda current_driver: current_driver.find_elements(
+                By.CSS_SELECTOR, region_selector
+            )
+        )
+        WebDriverWait(driver, 5).until(
+            lambda current_driver: current_driver.find_elements(
+                By.CSS_SELECTOR, carousel_selector
+            )
+        )
+
+        collected_images: dict[str, dict[str, str]] = {}
+
+        def collect_visible_images() -> None:
+            for photo_button in driver.find_elements(By.CSS_SELECTOR, photo_selector):
+                title = (photo_button.get_attribute("aria-label") or "").strip()
+                image_elements = photo_button.find_elements(By.CSS_SELECTOR, "img[src]")
+                image = (
+                    image_elements[0].get_attribute("src")
+                    if image_elements
+                    else ""
+                )
+                if title and image:
+                    collected_images[title] = {"url": image, "title": title}
+
+        carousel = driver.find_elements(By.CSS_SELECTOR, carousel_selector)
+        if carousel:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+                carousel[0],
+            )
+            try:
+                carousel_size = carousel[0].size
+                ActionChains(driver).move_to_element_with_offset(
+                    carousel[0],
+                    max(int(carousel_size.get("width", 0) / 2) - 5, 0),
+                    0,
+                ).perform()
+                time.sleep(0.5)
+            except Exception as exc:
+                LOG.debug("Could not hover the menu photo carousel: %s", exc)
+
+        collect_visible_images()
+
+        # Google initially mounts only the first few menu photos. Hovering the
+        # carousel's next control makes the remaining lazy-loaded photos appear.
+        next_buttons = driver.find_elements(
+            By.CSS_SELECTOR,
+            f'{carousel_selector} button[jsaction*="pane."][jsaction*=".next"]',
+        )
+        if next_buttons:
+            try:
+                ActionChains(driver).move_to_element(next_buttons[0]).perform()
+                time.sleep(0.5)
+            except Exception as exc:
+                LOG.debug("Could not expand the menu photo carousel: %s", exc)
+
+        collect_visible_images()
+
+        expected_count = 0
+        for title in collected_images:
+            match = re.search(r"\bof\s+(\d+)\b", title, re.IGNORECASE)
+            if match:
+                expected_count = int(match.group(1))
+                break
+
+        # Some Maps layouts only reveal the next batch after clicking Next.
+        # Walk the carousel while retaining URLs from every mounted batch.
+        if expected_count and len(collected_images) < expected_count:
+            previous_titles: set[str] = set()
+            for _ in range(expected_count + 2):
+                collect_visible_images()
+                if len(collected_images) >= expected_count:
+                    break
+
+                current_titles = {
+                    title
+                    for title in collected_images
+                    if title.startswith("Photo ")
+                }
+                if current_titles == previous_titles and previous_titles:
+                    break
+                previous_titles = current_titles
+
+                next_buttons = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    f'{carousel_selector} button[jsaction*="pane."][jsaction*=".next"]',
+                )
+                if not next_buttons:
+                    break
+                try:
+                    ActionChains(driver).move_to_element(next_buttons[0]).perform()
+                    driver.execute_script("arguments[0].click();", next_buttons[0])
+                    time.sleep(0.35)
+                except Exception as exc:
+                    LOG.debug("Could not advance the menu photo carousel: %s", exc)
+                    break
+
+        payload = driver.execute_script(
+            f"""
+            const region = document.querySelector({json.dumps(region_selector)});
+            if (!region) return {{}};
+            const clean = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const menuLink = Array.from(region.querySelectorAll('a[href]')).find((el) =>
+              /\\bmenu\\b/i.test(clean(el.getAttribute('aria-label')) || clean(el.textContent))
+            );
+            const data = Array.from(region.querySelectorAll(
+              'button[aria-label^="Photo "] img[src]'
+            )).map((img) => {{
+              const button = img.closest('button');
+              return {{
+                title: clean(button && button.getAttribute('aria-label')),
+                url: img.getAttribute('src') || '',
+              }};
+            }}).filter((item) => item.url);
+            const highlights = Array.from(region.querySelectorAll(
+              'button[data-carousel-index][aria-label]'
+            )).map((button) => {{
+              const image = button.querySelector('img[src]');
+              return {{
+                url: image ? image.getAttribute('src') || '' : '',
+                title: clean(button.getAttribute('aria-label')),
+              }};
+            }}).filter((item) => item.title
+              && item.title.toLowerCase() !== 'menu'
+              && !/^Photo \\d+ of \\d+$/i.test(item.title));
+            return {{
+              menu: menuLink ? {{
+                link: menuLink.getAttribute('href') || '',
+                source: clean(menuLink.getAttribute('aria-label')) || clean(menuLink.textContent),
+              }} : null,
+              data,
+              highlights: highlights.filter((item, index, values) => values.findIndex(
+                (candidate) => candidate.title === item.title && candidate.url === item.url
+              ) === index),
+            }};
+            """
+        ) or {}
+        if collected_images:
+            payload["data"] = sorted(
+                collected_images.values(),
+                key=lambda item: int(
+                    re.search(r"Photo\s+(\d+)", item["title"], re.IGNORECASE).group(1)
+                )
+                if re.search(r"Photo\s+(\d+)", item["title"], re.IGNORECASE)
+                else 0,
+            )
+        return payload if isinstance(payload, dict) else {}
+    except Exception as exc:
+        LOG.warning("Failed to extract Menu tab details: %s", exc)
+        return {}
+
+
+def extract_menu_and_actions(driver) -> dict[str, Any]:
+    """Read menu link, menu photos, reservation links, and highlighted dishes."""
+    payload = driver.execute_script(
+        r"""
+        const attr = (el, name) => (el && el.getAttribute(name) || '').trim();
+        const text = (el) => (el && el.textContent || '').trim();
+        const links = Array.from(document.querySelectorAll('a[href]')).map((el) => ({
+          label: attr(el, 'aria-label') || text(el),
+          url: attr(el, 'href'),
+        }));
+        const firstLink = (patterns) => links.find((item) => {
+          const value = String(item.label || '').toLowerCase();
+          return patterns.some((pattern) => value.includes(pattern));
+        }) || null;
+        const allLinks = (patterns) => links.filter((item) => {
+          const value = String(item.label || '').toLowerCase();
+          return patterns.some((pattern) => value.includes(pattern));
+        });
+        const menu = firstLink(['menu ', 'menu:']);
+        const highlights = Array.from(document.querySelectorAll('button[aria-label]'))
+          .map((el) => attr(el, 'aria-label'))
+          .filter((label) => /(?:^| · )Photo \d+ of \d+$/i.test(label))
+          .map((label) => label.replace(/\s*·\s*Photo \d+ of \d+$/i, '').trim())
+          .filter(Boolean);
+        return {
+          menu,
+          highlights: [...new Set(highlights)].slice(0, 30),
+          reservations: allLinks(['reserve a table', 'find a table', 'book a table']),
+          orderOnline: allLinks(['place an order', 'order online', 'delivery']),
+        };
+        """
+    )
+    payload = payload if isinstance(payload, dict) else {}
+    selected_menu = False
+    try:
+        selected_menu = _select_place_tab(driver, "Menu")
+        if selected_menu:
+            menu_details = _extract_menu_tab_details(driver)
+            if menu_details.get("menu"):
+                payload["menu"] = menu_details["menu"]
+            if menu_details.get("data"):
+                payload["data"] = menu_details["data"]
+            if menu_details.get("highlights"):
+                payload["highlights"] = menu_details["highlights"]
+    except Exception as exc:
+        LOG.warning("Failed to read Menu tab: %s", exc)
+    finally:
+        if selected_menu:
+            try:
+                _select_place_tab(driver, "Overview")
+            except Exception as exc:
+                LOG.warning("Failed to restore Overview tab after Menu: %s", exc)
+    return payload
+
+
+def extract_opening_hours(
+    driver,
+    resolved_url: str,
+    place_title: str = "",
+) -> tuple[dict[str, list[str]], list[dict[str, Any]]]:
+    """Open the Hours panel, preserve the legacy weekly map, and retain secondary groups."""
+    regular: dict[str, list[str]] = {}
+    secondary: list[dict[str, Any]] = []
+    opened_hours_panel = False
+    try:
+        copy_hours_selector = (
+            'button[aria-label*="Copy open hours"], '
+            'button[aria-label*="Copy business hours"]'
+        )
+        # Maps currently renders the weekly table in the DOM before exposing a
+        # clickable data-item-id="oh" button. Read that DOM instead of returning
+        # early merely because the status/toggle is a span or div.
+        hours_dom_present = bool(driver.find_elements(By.CSS_SELECTOR, copy_hours_selector))
+        if not hours_dom_present:
+            candidates = driver.find_elements(
+                By.CSS_SELECTOR,
+                'button[data-item-id="oh"], button[aria-label^="Hours"], '
+                '[aria-label*="See more hours"], '
+                '[aria-label^="Show open hours for the week"]',
+            )
+            hours_button = next((item for item in candidates if item.is_displayed()), None)
+            if not hours_button:
+                hours_button = driver.execute_script(
+                    """
+                    const status = document.querySelector('span.ZDu9vd');
+                    return status && (status.closest('button, [role="button"]')
+                      || status.parentElement
+                      || status);
+                    """
+                )
+            if hours_button:
+                driver.execute_script("arguments[0].click();", hours_button)
+                opened_hours_panel = True
+                WebDriverWait(driver, 5).until(
+                    lambda current_driver: bool(current_driver.find_elements(
+                        By.CSS_SELECTOR,
+                        f'{copy_hours_selector}, table tr, '
+                        'button[data-item-id="oh"][aria-expanded="true"]',
+                    ))
+                )
+            else:
+                LOG.info("Opening hours control and weekly-hours DOM are unavailable")
+
+        group_buttons = driver.find_elements(
+            By.CSS_SELECTOR,
+            '[aria-label^="Show open hours for the week"]',
+        )
+        for button in group_buttons:
+            if button.get_attribute("aria-expanded") != "true":
+                try:
+                    driver.execute_script("arguments[0].click();", button)
+                    time.sleep(0.25)
+                except Exception:
+                    continue
+
+        groups = driver.execute_script(
+            r"""
+            const attr = (el, name) => (el && el.getAttribute(name) || '').trim();
+            const buttons = Array.from(document.querySelectorAll(
+              '[aria-label^="Show open hours for the week"]'
+            ));
+            const tables = Array.from(document.querySelectorAll('table'));
+            const following = (anchor, candidate) =>
+              Boolean(anchor.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING);
+            return buttons.map((button, index) => {
+              const nextButton = buttons[index + 1] || null;
+              const table = tables.find((candidate) =>
+                following(button, candidate) && (!nextButton || following(candidate, nextButton))
+              );
+              const labels = table ? Array.from(table.querySelectorAll(
+                'button[aria-label*="Copy open hours"], button[aria-label*="Copy business hours"]'
+              ))
+                .map((el) => attr(el, 'aria-label')).filter(Boolean) : [];
+              const rows = table ? Array.from(table.querySelectorAll('tr'))
+                .map((row) => Array.from(row.querySelectorAll('th, td'))
+                  .map((cell) => (cell.textContent || '').replace(/\s+/g, ' ').trim())
+                  .filter(Boolean))
+                .filter((cells) => cells.length) : [];
+              return { label: attr(button, 'aria-label'), labels, rows };
+            });
+            """
+        ) or []
+
+        for index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            hours: dict[str, list[str]] = {}
+            for label in group.get("labels") or []:
+                parsed = parse_open_hours_copy_label(str(label))
+                if parsed:
+                    day, ranges = parsed
+                    hours[day] = ranges
+            if not hours:
+                for row in group.get("rows") or []:
+                    cells = row if isinstance(row, list) else str(row).splitlines()
+                    parsed = parse_open_hours_cells(cells)
+                    if parsed:
+                        day, ranges = parsed
+                        hours[day] = ranges
+
+            label = str(group.get("label") or "")
+            group_name = re.sub(r"^Show open hours for the week\s*", "", label, flags=re.I).strip()
+            if index == 0:
+                regular.update(hours)
+            elif hours:
+                secondary.append({"name": group_name or f"Secondary {index}", "hours": hours})
+
+        if not regular:
+            for button in driver.find_elements(By.CSS_SELECTOR, copy_hours_selector):
+                parsed = parse_open_hours_copy_label(button.get_attribute("aria-label") or "")
+                if parsed:
+                    day, ranges = parsed
+                    regular[day] = ranges
+        if not regular:
+            rows = driver.execute_script(
+                r"""
+                const text = (el) => (el && el.textContent || '').replace(/\s+/g, ' ').trim();
+                return Array.from(document.querySelectorAll('table tr'))
+                  .map((row) => Array.from(row.querySelectorAll('th, td'))
+                    .map((cell) => text(cell)).filter(Boolean))
+                  .filter((cells) => cells.length);
+                """
+            ) or []
+            for row in rows:
+                parsed = parse_open_hours_cells(row if isinstance(row, list) else [])
+                if parsed:
+                    day, ranges = parsed
+                    regular[day] = ranges
+    except Exception as exc:
+        LOG.warning("Failed to extract opening hours: %s", exc)
+    finally:
+        if opened_hours_panel:
+            try:
+                place_button = next(
+                    (
+                        button
+                        for button in driver.find_elements(By.CSS_SELECTOR, "button[aria-label]")
+                        if place_title
+                        and (button.get_attribute("aria-label") or "").strip() == place_title.strip()
+                    ),
+                    None,
+                )
+                if place_button:
+                    driver.execute_script("arguments[0].click();", place_button)
+                    time.sleep(2)
+                else:
+                    driver.get(google_maps_english_url(resolved_url))
+                    time.sleep(3)
+                    dismiss_cookies(driver)
+            except Exception as exc:
+                LOG.warning("Failed to restore place page after Hours panel: %s", exc)
+    return regular, secondary
+
+
+def _select_place_tab(driver, tab_name: str) -> bool:
+    tabs = driver.find_elements(By.CSS_SELECTOR, '[role="tab"]')
+    expected = tab_name.strip().lower()
+    tab = next(
+        (
+            item
+            for item in tabs
+            if (item.get_attribute("aria-label") or item.text or "").strip().lower() == expected
+            or (item.get_attribute("aria-label") or "").strip().lower().startswith(f"{expected} ")
+        ),
+        None,
+    )
+    if not tab:
+        return False
+    driver.execute_script("arguments[0].click();", tab)
+    try:
+        WebDriverWait(driver, 5).until(
+            lambda _driver: tab.get_attribute("aria-selected") == "true"
+        )
+        if expected == "about":
+            WebDriverWait(driver, 5).until(
+                lambda current_driver: current_driver.execute_script(
+                    r"""
+                    const names = new Set([
+                      'accessibility', 'service options', 'highlights', 'popular for',
+                      'offerings', 'dining options', 'amenities', 'atmosphere',
+                      'crowd', 'planning', 'payments', 'children', 'parking'
+                    ]);
+                    return Array.from(document.querySelectorAll('h2'))
+                      .some((heading) => names.has((heading.textContent || '').trim().toLowerCase()));
+                    """
+                )
+            )
+        return True
+    except Exception:
+        return tab.get_attribute("aria-selected") == "true"
+
+
+def extract_about_sections(driver) -> list[dict[str, Any]]:
+    """Open the About tab and emit the exact PlaceAbout DTO-compatible structure."""
+    raw_sections: list[dict[str, Any]] = []
+    selected_about = False
+    try:
+        selected_about = _select_place_tab(driver, "About")
+        if not selected_about:
+            return []
+        _scroll_main_panel(driver, max_steps=12)
+        raw_sections = driver.execute_script(
+            r"""
+            const main = document.querySelector('main, [role="main"]') || document.body;
+            const region = main.querySelector('[role="region"][aria-label^="About "]') || main;
+            const attr = (el, name) => (el && el.getAttribute(name) || '').trim();
+            const text = (el) => (el && el.textContent || '').replace(/\s+/g, ' ').trim();
+            const headings = Array.from(region.querySelectorAll('h2'));
+            const labelled = Array.from(region.querySelectorAll('[aria-label]'));
+            const following = (anchor, candidate) =>
+              Boolean(anchor.compareDocumentPosition(candidate) & Node.DOCUMENT_POSITION_FOLLOWING);
+            return headings.map((heading, index) => {
+              const nextHeading = headings[index + 1] || null;
+              const options = labelled.filter((candidate) =>
+                following(heading, candidate) && (!nextHeading || following(candidate, nextHeading))
+              ).map((candidate) => ({
+                label: attr(candidate, 'aria-label'),
+                text: text(candidate),
+              })).filter((item) => item.label && !/^(About |Reserve a table|Sign in)/i.test(item.label));
+              return { name: text(heading), options };
+            }).filter((section) => section.name && section.options.length);
+            """
+        ) or []
+    except Exception as exc:
+        LOG.warning("Failed to extract About tab: %s", exc)
+    finally:
+        if selected_about:
+            try:
+                _select_place_tab(driver, "Overview")
+            except Exception as exc:
+                LOG.warning("Failed to restore Overview tab after About: %s", exc)
+
+    sections: list[dict[str, Any]] = []
+    for raw_section in raw_sections:
+        if not isinstance(raw_section, dict):
+            continue
+        name = str(raw_section.get("name") or "").strip()
+        options: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw_option in raw_section.get("options") or []:
+            if not isinstance(raw_option, dict):
+                continue
+            option = normalize_about_option(
+                str(raw_option.get("label") or ""),
+                str(raw_option.get("text") or ""),
+            )
+            if not option:
+                continue
+            key = option["name"].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            options.append(option)
+        if name and options:
+            sections.append({"id": _slugify(name), "name": name, "options": options})
+    return sections
+
+
+def extract_overview_about_summary(driver) -> list[dict[str, Any]]:
+    """Fallback for places where Google exposes only the Overview About summary."""
+    raw_options = driver.execute_script(
+        r"""
+        const regions = Array.from(document.querySelectorAll('[aria-label^="About "]'));
+        const region = regions.find((el) => el.querySelectorAll('[aria-label]').length) || null;
+        if (!region) return [];
+        return Array.from(region.querySelectorAll('[aria-label]'))
+          .filter((el) => !el.querySelector('[aria-label]'))
+          .map((el) => ({
+            label: (el.getAttribute('aria-label') || '').trim(),
+            text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+          }))
+          .filter((item) => item.label && !item.label.startsWith('About '));
+        """
+    ) or []
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw_option in raw_options:
+        if not isinstance(raw_option, dict):
+            continue
+        option = normalize_about_option(
+            str(raw_option.get("label") or ""),
+            str(raw_option.get("text") or ""),
+        )
+        if not option:
+            continue
+        key = option["name"].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append(option)
+    if not options:
+        return []
+    return [{"id": "service_options", "name": "Service options", "options": options}]
+
+
+def _normalize_menu_items(items: Any, *, require_url: bool = False) -> list[dict[str, str]]:
+    """Normalize menu image/highlight values to the public {url, title} shape."""
+    if not isinstance(items, list):
+        return []
+
+    normalized: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in items:
+        if isinstance(item, dict):
+            url = str(item.get("url") or item.get("image") or "").strip()
+            title = str(item.get("title") or item.get("name") or "").strip()
+        elif isinstance(item, str):
+            url = ""
+            title = item.strip()
+        else:
+            continue
+
+        if require_url and not url:
+            continue
+        if not require_url and title.lower() == "menu":
+            continue
+        if not url and not title:
+            continue
+        key = (url, title)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"url": url, "title": title})
+    return normalized
+
+
 def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]:
     LOG.info("Extracting place detail")
     lat, lng = extract_coords(resolved_url)
     
     # First try to extract Place ID from URL
     place_id = extract_place_id(input_url, resolved_url)
+
+    # Google lazily mounts hours, popular-times, owner and contact rows while the
+    # place pane scrolls. Load the full Overview before reading any field.
+    _scroll_main_panel(driver, max_steps=14)
     
     raw = driver.execute_script(
-        """
+        r"""
         const text = (el) => (el && el.textContent || '').trim();
         const attr = (el, name) => (el && el.getAttribute(name) || '').trim();
         const pickText = (selectors) => {
@@ -589,6 +1570,30 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
             }
           }
           return {label: '', href: '', text: ''};
+        };
+        const infoElements = Array.from(document.querySelectorAll(
+          'button[data-item-id], a[data-item-id], button[aria-label], a[aria-label], a[href^="tel:"]'
+        ));
+        const byItemId = (predicate) => {
+          const el = infoElements.find((candidate) => predicate(
+            attr(candidate, 'data-item-id'),
+            attr(candidate, 'aria-label'),
+            attr(candidate, 'href')
+          ));
+          return el ? {
+            itemId: attr(el, 'data-item-id'),
+            label: attr(el, 'aria-label'),
+            href: attr(el, 'href'),
+            text: text(el).replace(/\s+/g, ' ').trim(),
+          } : {itemId: '', label: '', href: '', text: ''};
+        };
+        const prefixedValue = (item, prefixes) => {
+          const label = String(item.label || '').trim();
+          for (const prefix of prefixes) {
+            const expression = new RegExp('^' + prefix + '\\s*:\\s*', 'i');
+            if (expression.test(label)) return label.replace(expression, '').trim();
+          }
+          return String(item.text || label || '').trim();
         };
         
         // Try to extract Google Place ID from page meta/data
@@ -715,10 +1720,14 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
           .filter(item => item !== null)
           .slice(0, 30);  // Limit to 30 images
         
-        const address = byAria(['address', 'địa chỉ', 'dia chi']);
-        const phone = byAria(['phone', 'call', 'điện thoại', 'dien thoai', 'telephone']);
-        const website = byAria(['website', 'trang web', 'site web']);
-        const plusCode = byAria(['plus code']);
+        const address = byItemId((id, label) => id === 'address' || /^(Address|Địa chỉ)\s*:/i.test(label));
+        const phone = byItemId((id, label, href) =>
+          id.startsWith('phone:tel:') || href.startsWith('tel:') || /^(Phone|Điện thoại)\s*:/i.test(label)
+        );
+        const website = byItemId((id, label) => id === 'authority' || /^(Website|Trang web)\s*:/i.test(label));
+        const plusCode = byItemId((id, label) => id === 'oloc' || /^Plus code\s*:/i.test(label));
+        const hours = byItemId((id, label) => id === 'oh' || /^Hours\b/i.test(label));
+        const price = byItemId((id, label) => id.startsWith('price') || /^Price range\b/i.test(label));
         const menu = byAria(['menu', 'thực đơn', 'thuc don']);
         
         // Extract reservations info
@@ -726,30 +1735,56 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         
         // Extract order online info
         const orderOnline = byAria(['order online', 'đặt món', 'delivery']);
+        const ownerUpdateButton = Array.from(document.querySelectorAll('button')).find((el) =>
+          /see local posts/i.test(attr(el, 'aria-label') || text(el))
+        );
+        const ownerUpdateText = ownerUpdateButton
+          ? (attr(ownerUpdateButton, 'aria-label') || text(ownerUpdateButton)).replace(/\s+/g, ' ').trim()
+          : '';
+        const emails = Array.from(document.querySelectorAll('a[href^="mailto:"]'))
+          .map((el) => attr(el, 'href').replace(/^mailto:/i, '').split('?')[0].trim())
+          .filter(Boolean);
         
         return {
           placeIdFromPage: getPlaceIdFromPage(),
           title: pickText(['h1.DUwDvf', 'h1']),
           category: pickText(['button.DkEaL', 'button[jsaction*="category"]']),
           categories,
-          address: address.label || address.text,
-          phone: phone.label || phone.text,
+          address: prefixedValue(address, ['Address', 'Địa chỉ']),
+          phone: prefixedValue(phone, ['Phone', 'Điện thoại']) || phone.href.replace(/^tel:/i, ''),
           website: website.href || website.label || website.text,
-          plusCode: plusCode.label || plusCode.text,
+          plusCode: prefixedValue(plusCode, ['Plus code']),
           status: pickText(['span.ZDu9vd']),
+          currentOpenStatus: hours.label || hours.text,
           description: pickText(['div.PYvSYb', 'div.WeS02d div.PYvSYb']),
-          priceRange: pickText(['span.mgr77e']),
+          priceRange: price.label || price.text || pickText(['span.mgr77e']),
           thumbnail: pickAttr(['button[jsaction*="heroHeaderImage"] img'], 'src'),
           menu: {link: menu.href, source: menu.text || menu.label},
           images,
           dataId: getDataId(),
           reservations: {available: !!reservations.href, link: reservations.href, text: reservations.text},
           orderOnline: {available: !!orderOnline.href, link: orderOnline.href, text: orderOnline.text},
+          owner: {hasUpdates: !!ownerUpdateText, latestUpdate: ownerUpdateText},
+          emails,
+          informationRows: [address, hours, price, website, phone, plusCode]
+            .filter((item) => item.itemId || item.label || item.href || item.text),
         };
-        """
+        r"""
     ) or {}
     
+    raw = normalize_place_information(raw)
     rating_summary = js_extract_rating_summary(driver)
+    overview_about = extract_overview_about_summary(driver)
+    menu_actions = extract_menu_and_actions(driver)
+    popular_times, live_popular_times = extract_popular_times(driver)
+    open_hours, secondary_open_hours = extract_opening_hours(
+        driver,
+        resolved_url,
+        str(raw.get("title") or ""),
+    )
+    about = extract_about_sections(driver)
+    if not about:
+        about = overview_about
     
     # Use Place ID from page if found and it's in ChIJ format
     page_place_id = raw.get("placeIdFromPage", "")
@@ -761,7 +1796,12 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         # If we don't have ChIJ format yet, keep what we extracted from URL
         LOG.info("No ChIJ Place ID found, using: %s", place_id)
 
-    title = raw.get("title") or (driver.title or "").replace(" - Google Maps", "").strip()
+    title = str(raw.get("title") or "").strip()
+    if not title:
+        # No silent fallback to driver.title: on a blocked/failed navigation that tab
+        # title is often the requested URL itself, which would otherwise get written
+        # straight into places.title on the next refresh.
+        raise RuntimeError(f"Could not read place title (no h1 on page) for {resolved_url}")
     categories = raw.get("categories") or []
     category = raw.get("category") or (categories[0] if categories else "")
     rating = first_float(rating_summary.get("ratingText", ""))
@@ -771,12 +1811,14 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         reviews_per_rating = {str(k): int(v) for k, v in reviews_per_rating.items() if v}
     else:
         reviews_per_rating = {}
+    data_id = extract_data_id(resolved_url, input_url) or str(raw.get("dataId") or "")
     
     # Extract CID from place_id or URL
     cid = ""
-    if ":" in place_id and "0x" in place_id:
+    cid_source = data_id or place_id
+    if ":" in cid_source and "0x" in cid_source:
         # Format: 0x3135abeaa030f36b:0xbe242aab5ec1e373
-        parts = place_id.split(":")
+        parts = cid_source.split(":")
         if len(parts) == 2 and parts[1].startswith("0x"):
             # Convert hex to decimal for CID
             try:
@@ -809,10 +1851,8 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
     # Extract timezone from coordinates (simple approximation for Vietnam)
     timezone = "Asia/Saigon" if lat and lng and 8 < lat < 24 and 102 < lng < 110 else "UTC"
     
-    # Build Google Maps link with CID
+    # Preserve the inspectable canonical URL; CID remains available as its own identity field.
     google_maps_link = resolved_url
-    if cid:
-        google_maps_link = f"https://maps.google.com/?cid={cid}"
     
     LOG.info(
         "Place detail extracted: title=%r rating=%s review_count=%s place_id=%s",
@@ -829,6 +1869,24 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         if isinstance(img, dict) and "image" in img:
             img["image"] = upscale_image_url(img["image"], scale=10)
 
+    # Google does not render a hero-header button on every place, and the pane
+    # is already scrolled past the header by the time this reads the DOM. The
+    # first gallery photo is that same cover image, so fall back to it rather
+    # than importing a place with no cover at all.
+    if not thumbnail:
+        thumbnail = next(
+            (
+                img.get("image", "")
+                for img in images
+                if isinstance(img, dict) and img.get("image")
+            ),
+            "",
+        )
+        if thumbnail:
+            LOG.info("Hero header image absent; using the first gallery photo as thumbnail")
+        else:
+            LOG.warning("No thumbnail and no gallery photos for %r", title)
+
     if thumbnail:
         thumb_base = thumbnail.split("=", 1)[0]
         images = [
@@ -839,13 +1897,81 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         images.insert(0, {"title": title, "image": thumbnail})
         images = images[:30]
 
+    menu_data_raw = menu_actions.get("data", []) if isinstance(menu_actions, dict) else []
+    if not menu_data_raw and isinstance(menu_actions, dict):
+        menu_data_raw = menu_actions.get("images", [])
+    menu_highlights_raw = menu_actions.get("highlights", []) if isinstance(menu_actions, dict) else []
+    menu_data = _normalize_menu_items(menu_data_raw, require_url=True)
+    menu_highlights = _normalize_menu_items(menu_highlights_raw)
+    menu_link = menu_actions.get("menu") if isinstance(menu_actions, dict) else None
+    raw_menu = raw.get("menu") if isinstance(raw.get("menu"), dict) else {}
+    has_menu = bool(
+        menu_data
+        or menu_highlights
+        or (isinstance(menu_link, dict) and (menu_link.get("url") or menu_link.get("link")))
+        or raw_menu.get("link")
+    )
+    scraped_menu: dict[str, Any] = {}
+    if has_menu:
+        scraped_menu["data"] = [
+            {
+                "url": upscale_image_url(item["url"], scale=10),
+                "title": item["title"],
+            }
+            for item in menu_data
+        ]
+        scraped_menu["highlights"] = [
+            {
+                "url": upscale_image_url(item["url"], scale=10) if item["url"] else "",
+                "title": item["title"],
+            }
+            for item in menu_highlights
+        ]
+
+    reservation_links = menu_actions.get("reservations", []) if isinstance(menu_actions, dict) else []
+    reservations = raw.get("reservations", {})
+    if reservation_links:
+        reservations = {
+            "available": True,
+            "link": reservation_links[0].get("url", ""),
+            "text": reservation_links[0].get("label", ""),
+            "links": reservation_links,
+        }
+
+    order_links = menu_actions.get("orderOnline", []) if isinstance(menu_actions, dict) else []
+    order_online = raw.get("orderOnline", {})
+    if order_links:
+        order_online = {
+            "available": True,
+            "link": order_links[0].get("url", ""),
+            "text": order_links[0].get("label", ""),
+            "links": order_links,
+        }
+
+    raw_data = {
+        "source": "google_maps_web",
+        "sourceLocale": "en",
+        "scrapedAt": now_iso(),
+        "openingHours": {
+            "regular": open_hours,
+            "secondary": secondary_open_hours,
+        },
+        "popularTimesLive": live_popular_times,
+        "menuHighlights": menu_highlights,
+        "categories": categories,
+        "informationRows": raw.get("informationRows") or [],
+        "currentOpenStatus": raw.get("currentOpenStatus", ""),
+        "owner": raw.get("owner") or {},
+        "emails": raw.get("emails") or [],
+    }
+
     return {
         "input_url": input_url,
         "resolved_url": resolved_url,
         "place_id": place_id,
         "placeId": place_id,  # Alias
         "cid": cid,
-        "dataId": raw.get("dataId", ""),
+        "dataId": data_id,
         "link": resolved_url,
         "googleMapsLink": google_maps_link,
         "title": title,
@@ -871,33 +1997,42 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         "longitude": lng,
         "longtitude": lng,
         "status": raw.get("status", ""),
+        "currentOpenStatus": raw.get("currentOpenStatus", ""),
         "description": raw.get("description", ""),
         "descriptions": raw.get("description", ""),  # Alias
         "thumbnail": thumbnail,
         "priceRange": raw.get("priceRange", ""),
         "price_range": raw.get("priceRange", ""),
         "images": images,
-        "menu": raw.get("menu", {}),
-        "reservations": raw.get("reservations", {}),
-        "orderOnline": raw.get("orderOnline", {}),
-        "openHours": {},
-        "open_hours": {},
-        "popularTimes": {},
-        "popular_times": {},
-        "owner": {},
-        "completeAddress": {},
-        "complete_address": {},
-        "about": [],
+        "menu": scraped_menu,
+        "reservations": reservations,
+        "orderOnline": order_online,
+        "regular": open_hours,
+        "openHours": open_hours,
+        "open_hours": open_hours,
+        "popularTimes": popular_times,
+        "popular_times": popular_times,
+        "owner": raw.get("owner") or {},
+        "completeAddress": {
+            "formatted": raw.get("address", ""),
+            "plusCode": raw.get("plusCode", ""),
+        },
+        "complete_address": {
+            "formatted": raw.get("address", ""),
+            "plusCode": raw.get("plusCode", ""),
+        },
+        "about": about,
         "reviewsLink": "",
         "reviews_link": "",
-        "emails": [],
-        "rawData": {},  # Will be populated if needed
+        "emails": raw.get("emails") or [],
+        "rawData": raw_data,
     }
 
 
-def click_sort_newest(driver) -> None:
+def click_sort_newest_legacy(driver) -> None:
     """Click the sort button and select 'Newest' to get reviews in chronological order."""
     LOG.info("Attempting to sort reviews by newest")
+    setattr(driver, "goroute_sorted_newest", False)
     
     try:
         # Wait a bit for reviews to load
@@ -945,6 +2080,7 @@ def click_sort_newest(driver) -> None:
                     driver.execute_script("arguments[0].click();", item)
                     time.sleep(2)
                     LOG.info("Successfully sorted reviews by newest")
+                    setattr(driver, "goroute_sorted_newest", True)
                     return
             except Exception:
                 continue
@@ -953,6 +2089,176 @@ def click_sort_newest(driver) -> None:
         
     except Exception as exc:
         LOG.warning("Could not sort reviews by newest: %s", exc)
+
+
+def click_sort_newest(driver, attempts: int = 3) -> None:
+    """Select Newest using visible text, aria labels, or textContent with retries."""
+    LOG.info("Attempting robust review sort by newest")
+    setattr(driver, "goroute_sorted_newest", False)
+    newest_keywords = (
+        "newest", "most recent", "mới nhất", "gần đây nhất", "最新", "最近",
+        "최신순", "ล่าสุด", "récent", "neueste", "más recientes",
+    )
+    sort_selectors = (
+        'button[aria-label*="Sort" i]',
+        'button[aria-label*="Sắp xếp" i]',
+        'button[data-value*="Sort" i]',
+        'button[jsaction*="sort" i]',
+    )
+
+    def element_text(element) -> str:
+        values = (
+            element.text,
+            element.get_attribute("aria-label"),
+            element.get_attribute("data-value"),
+            element.get_attribute("textContent"),
+        )
+        return " ".join(str(value or "") for value in values).casefold()
+
+    def click_visible_newest_option() -> bool:
+        menu_items = driver.find_elements(
+            By.CSS_SELECTOR,
+            '[role="menuitemradio"], [role="menuitem"], [role="menuitemcheckbox"], '
+            '[role="option"], [role="radio"], div[data-index]',
+        )
+        for item in menu_items:
+            try:
+                candidate = element_text(item)
+                if item.is_displayed() and any(keyword.casefold() in candidate for keyword in newest_keywords):
+                    LOG.info("Clicking Newest sort option: %r", candidate[:120])
+                    driver.execute_script("arguments[0].click();", item)
+                    time.sleep(2)
+                    setattr(driver, "goroute_sorted_newest", True)
+                    return True
+            except Exception:
+                continue
+
+        # Google periodically changes the role/class assigned to sort options.
+        # Restrict the fallback to visible popup containers, then locate a
+        # clickable ancestor by accessible label or text content.
+        try:
+            fallback = driver.execute_script(
+                """
+                const keywords = arguments[0];
+                const visible = (el) => {
+                  if (!el) return false;
+                  const style = getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== 'none' && style.visibility !== 'hidden'
+                    && rect.width > 0 && rect.height > 0;
+                };
+                const popupRoots = Array.from(document.querySelectorAll(
+                  '[role="menu"], [role="listbox"], [role="dialog"]'
+                )).filter(visible);
+                const roots = popupRoots.length ? popupRoots : [document];
+                const selector = [
+                  '[role="menuitemradio"]', '[role="menuitem"]',
+                  '[role="menuitemcheckbox"]', '[role="option"]',
+                  '[role="radio"]', 'button', '[tabindex="0"]', 'div[data-index]'
+                ].join(',');
+                for (const root of roots) {
+                  for (const element of root.querySelectorAll(selector)) {
+                    if (!visible(element)) continue;
+                    const value = [
+                      element.textContent || '',
+                      element.getAttribute('aria-label') || '',
+                      element.getAttribute('data-value') || ''
+                    ].join(' ').toLocaleLowerCase();
+                    if (keywords.some(keyword => value.includes(keyword))) return element;
+                  }
+                }
+                return null;
+                """,
+                [keyword.casefold() for keyword in newest_keywords],
+            )
+            if fallback is not None and fallback.is_displayed():
+                candidate = element_text(fallback)
+                LOG.info("Clicking Newest fallback option: %r", candidate[:120])
+                driver.execute_script("arguments[0].click();", fallback)
+                time.sleep(2)
+                setattr(driver, "goroute_sorted_newest", True)
+                return True
+        except Exception as exc:
+            LOG.debug("Newest DOM fallback failed: %s", exc)
+        return False
+
+    def close_open_sort_menu() -> None:
+        try:
+            ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def visible_sort_options() -> list[str]:
+        try:
+            return list(driver.execute_script(
+                """
+                const visible = (el) => {
+                  const style = getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== 'none' && style.visibility !== 'hidden'
+                    && rect.width > 0 && rect.height > 0;
+                };
+                return Array.from(document.querySelectorAll(
+                  '[role="menuitemradio"], [role="menuitem"], [role="menuitemcheckbox"], ' +
+                  '[role="option"], [role="radio"], div[data-index]'
+                )).filter(visible).map(el => (
+                  el.getAttribute('aria-label') || el.textContent || el.getAttribute('data-value') || ''
+                ).trim()).filter(Boolean).slice(0, 12);
+                """
+            ) or [])
+        except Exception:
+            return []
+
+    time.sleep(2)
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            if attempt > 1:
+                # Ensure the previous popup is closed. Otherwise clicking the
+                # sort button on retry merely toggles an already-open menu off.
+                close_open_sort_menu()
+
+            if click_visible_newest_option():
+                LOG.info("Successfully sorted reviews by newest")
+                return
+
+            sort_button = None
+            for selector in sort_selectors:
+                for button in driver.find_elements(By.CSS_SELECTOR, selector):
+                    if button.is_displayed():
+                        sort_button = button
+                        break
+                if sort_button is not None:
+                    break
+
+            if sort_button is None:
+                LOG.warning("Sort button not found (attempt %s/%s)", attempt, attempts)
+                time.sleep(1.5)
+                continue
+
+            button_label = element_text(sort_button)
+            if any(keyword.casefold() in button_label for keyword in newest_keywords):
+                setattr(driver, "goroute_sorted_newest", True)
+                LOG.info("Reviews are already sorted by newest")
+                return
+
+            driver.execute_script("arguments[0].click();", sort_button)
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if click_visible_newest_option():
+                    LOG.info("Successfully sorted reviews by newest")
+                    return
+                time.sleep(0.5)
+            LOG.warning(
+                "Newest sort option not found (attempt %s/%s); visible_options=%r",
+                attempt,
+                attempts,
+                visible_sort_options(),
+            )
+            close_open_sort_menu()
+        except Exception as exc:
+            LOG.warning("Could not sort reviews by newest (attempt %s/%s): %s", attempt, attempts, exc)
+        time.sleep(1.5)
 
 
 def click_reviews_tab(driver) -> None:
@@ -1222,15 +2528,23 @@ def parse_review(card, known_review_id: str = "") -> Review:
 
     owner_text = first_text(card, ['div.CDe7pd div.wiI7pd', 'div[class*="owner" i] div.wiI7pd'])
     reviewer_info = first_text(card, ['div.RfnDt'])
-    reviewer_is_local_guide = "local guide" in reviewer_info.lower()
+    reviewer_info_lower = reviewer_info.lower()
+    reviewer_is_local_guide = (
+        "local guide" in reviewer_info_lower
+        or "hướng dẫn viên địa phương" in reviewer_info_lower
+    )
     reviewer_total_reviews = 0
     reviewer_total_photos = 0
-    review_match = re.search(r"(\d+)\s+reviews?", reviewer_info, re.I)
-    photo_match = re.search(r"(\d+)\s+photos?", reviewer_info, re.I)
+    review_match = re.search(
+        r"([\d][\d\s,\.]*)\s+(?:reviews?|bài\s*(?:viết|đánh giá))",
+        reviewer_info,
+        re.I,
+    )
+    photo_match = re.search(r"([\d][\d\s,\.]*)\s+(?:photos?|ảnh)", reviewer_info, re.I)
     if review_match:
-        reviewer_total_reviews = int(review_match.group(1))
+        reviewer_total_reviews = first_int(review_match.group(1)) or 0
     if photo_match:
-        reviewer_total_photos = int(photo_match.group(1))
+        reviewer_total_photos = first_int(photo_match.group(1)) or 0
 
     review = Review(
         review_id=review_id,
@@ -1299,222 +2613,257 @@ def find_reviews_pane(driver):
     return None
 
 
-def scrape_reviews(driver, max_reviews: int, max_scrolls: int) -> list[dict[str, Any]]:
-    LOG.info("Starting review scrape: max_reviews=%s max_scrolls=%s", max_reviews, max_scrolls)
-    click_reviews_tab(driver)
-    
-    # Wait for reviews to load after clicking tab
-    time.sleep(3)
-    
-    pane = find_reviews_pane(driver)
-    seen: set[str] = set()
-    reviews: list[Review] = []
-    idle = 0
-    consecutive_no_cards = 0
-    last_scroll_position = 0
-    scroll_stuck_count = 0
+def normalize_max_reviews(max_reviews: int) -> int:
+    """Cap review output at the scraper safety limit; 0 means use the default."""
+    if max_reviews <= 0:
+        return DEFAULT_MAX_REVIEWS
+    return min(max_reviews, MAX_REVIEW_COLLECTION_LIMIT)
 
-    # Pre-setup scroll script for better performance
-    scroll_script = "window.scrollBy(0, 1200);"
-    if pane:
-        try:
-            driver.execute_script("window.scrollablePane = arguments[0];", pane)
-            scroll_script = "window.scrollablePane.scrollBy(0, window.scrollablePane.scrollHeight);"
-            LOG.info("Set up optimized scroll script for pane")
-        except Exception as exc:
-            LOG.debug("Could not set up pane scroll script: %s", exc)
 
-    for scroll_index in range(max_scrolls):
-        # Find cards in the pane, or fallback to entire page
-        if pane:
-            try:
-                cards = pane.find_elements(By.CSS_SELECTOR, REVIEW_CARD)
-            except Exception:
-                cards = driver.find_elements(By.CSS_SELECTOR, REVIEW_CARD)
-        else:
-            cards = driver.find_elements(By.CSS_SELECTOR, REVIEW_CARD)
-            
-        stats = {
-            "missing_id": 0,
-            "duplicate": 0,
-            "empty_after_parse": 0,
-            "stale": 0,
-            "parse_error": 0,
+def review_collection_limit(review_count: int | None, output_limit: int) -> int:
+    """Collect the newest image reviews only; their Google Maps order is preserved."""
+    return output_limit
+
+
+def select_recent_reviews_with_images(
+    reviews: list[dict[str, Any]],
+    max_reviews: int,
+) -> list[dict[str, Any]]:
+    """Keep Google Maps newest-first order and exclude reviews without images."""
+    return [review for review in reviews if review.get("photos") or review.get("images")][:max_reviews]
+
+
+def _find_unprocessed_review_cards(driver, pane) -> tuple[bool, int, list[dict[str, Any]]]:
+    """Extract newly loaded cards as plain data in one browser round trip.
+
+    Returning Selenium WebElements and then querying every field separately made
+    large review feeds extremely slow and could block ChromeDriver until its
+    120-second transport timeout. The script deliberately returns primitives only.
+    """
+    payload = driver.execute_script(
+        r"""
+        const roots = [
+          'div[role="main"] div.m6QErb.DxyBCb.kA9KIf.dS8AEf',
+          'div[role="main"] div.m6QErb.DxyBCb',
+          'div[role="main"] div.m6QErb',
+          'div[role="main"]'
+        ];
+        const root = roots.map(selector => document.querySelector(selector))
+          .find(element => element && element.querySelector('div[data-review-id]')) || document;
+        // Drop cards snapshotted in earlier iterations (keep a small tail as a
+        // scroll anchor). Thousands of retained cards make every scrollHeight
+        // layout slower until execute_script exceeds the driver read timeout.
+        const stale = Array.from(root.querySelectorAll('div[data-review-id][data-goroute-processed="1"]'));
+        for (const old of stale.slice(0, Math.max(0, stale.length - 10))) {
+          try { old.remove(); } catch (e) {}
         }
-        
-        LOG.info(
-            "Review scroll %d/%d: visible_cards=%d collected=%d idle=%d",
-            scroll_index + 1,
-            max_scrolls,
-            len(cards),
-            len(reviews),
-            idle,
+        const hasCards = Boolean(root.querySelector('div[data-review-id]'));
+        const cards = Array.from(
+          root.querySelectorAll('div[data-review-id]:not([data-goroute-processed="1"])')
+        );
+        const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+        const textOf = (card, selectors) => {
+          for (const selector of selectors) {
+            const element = card.querySelector(selector);
+            const value = clean(element && element.textContent);
+            if (value) return value;
+          }
+          return '';
+        };
+        const attrOf = (card, selectors, name) => {
+          for (const selector of selectors) {
+            const element = card.querySelector(selector);
+            const value = clean(element && element.getAttribute(name));
+            if (value) return value;
+          }
+          return '';
+        };
+        const fresh = [];
+        for (const card of cards) {
+          card.setAttribute('data-goroute-processed', '1');
+          const photos = [];
+          for (const button of card.querySelectorAll('button.Tya61d, button[style*="url"]')) {
+            const style = button.getAttribute('style') || '';
+            const match = style.match(/url\(["']?([^"')]+)["']?\)/);
+            if (match && match[1] && !photos.includes(match[1])) photos.push(match[1]);
+          }
+          const profileButton = card.querySelector('button[data-review-id]');
+          fresh.push({
+            snapshot: true,
+            reviewId: (card.getAttribute('data-review-id') || '').trim(),
+            author: textOf(card, [
+              'div[class*="d4r55"]', 'div[class*="ReviewerProfile"]',
+              'button[data-review-id] div', 'div.TSUbDb a', 'a[href*="/contrib/"]'
+            ]),
+            profileAriaLabel: clean(profileButton && profileButton.getAttribute('aria-label')),
+            profileUrl: attrOf(card, ['button[data-review-id]'], 'data-href') ||
+              attrOf(card, ['a[href*="/contrib/"]', 'button[data-review-id] a'], 'href'),
+            profilePicture: attrOf(card, ['button[data-review-id] img'], 'src'),
+            ratingLabel: attrOf(card, [
+              'span[role="img"][aria-label]', 'span[class*="kvMYJc" i]'
+            ], 'aria-label'),
+            rawDate: textOf(card, ['span[class*="rsqaWe"]', 'span[class*="xRkPPb" i]']),
+            text: textOf(card, [
+              'span[jsname="bN97Pc"]', 'span[jsname="fbQN7e"]',
+              'div.MyEned span.wiI7pd'
+            ]),
+            likesText: textOf(card, ['button[jsaction*="toggleThumbsUp" i]']),
+            ownerText: textOf(card, [
+              'div.CDe7pd div.wiI7pd', 'div[class*="owner" i] div.wiI7pd'
+            ]),
+            reviewerInfo: textOf(card, ['div.RfnDt']),
+            photos,
+            hasPhotos: photos.length > 0,
+          });
+        }
+        return {hasCards, newCardCount: cards.length, fresh};
+        """,
+    ) or {}
+    return (
+        bool(payload.get("hasCards")),
+        int(payload.get("newCardCount") or 0),
+        list(payload.get("fresh") or []),
+    )
+
+
+def _review_from_dom_payload(payload: dict[str, Any], review_id: str) -> Review:
+    author = str(payload.get("author") or "").strip()
+    if not author:
+        author = re.sub(
+            r"^photo of\s+",
+            "",
+            str(payload.get("profileAriaLabel") or "").strip(),
+            flags=re.I,
         )
-        
-        # Check for no cards situation
-        if len(cards) == 0:
-            consecutive_no_cards += 1
-            LOG.info("No review cards found in iteration (consecutive: %d)", consecutive_no_cards)
-            
-            if consecutive_no_cards > 5:
-                LOG.warning("No cards found for 5+ iterations - might be at end")
-                break
-                
-            # Try aggressive scrolling
-            try:
-                driver.execute_script(scroll_script)
-                time.sleep(0.8)
-                driver.execute_script("window.scrollBy(0, 1000);")
-                time.sleep(1.2)
-            except Exception as exc:
-                LOG.debug("Scroll error: %s", exc)
-            continue
-        else:
-            consecutive_no_cards = 0
-            
-        added = 0
-        fresh_cards = []
-        
-        # First pass: identify fresh cards
-        for card in cards:
-            try:
-                review_id = get_review_id(card)
-                if not review_id:
-                    stats["missing_id"] += 1
-                    continue
-                # Skip if already collected in previous iterations
-                if review_id in seen:
-                    stats["duplicate"] += 1
-                    continue
-                fresh_cards.append((card, review_id))
-            except StaleElementReferenceException:
-                stats["stale"] += 1
-                continue
-            except Exception as exc:
-                LOG.debug("Error getting review ID: %s", exc)
-                continue
-        
-        LOG.debug(
-            "Card filtering: total_cards=%d fresh=%d missing_id=%d duplicate=%d stale=%d",
-            len(cards),
-            len(fresh_cards),
-            stats["missing_id"],
-            stats["duplicate"],
-            stats["stale"],
-        )
-        
-        # Second pass: parse fresh cards
-        for card, review_id in fresh_cards:
-            try:
-                review = parse_review(card, review_id)
-                if not review.review_id:
-                    stats["empty_after_parse"] += 1
-                    LOG.warning("Review parsed but missing ID: review_id from card=%r", review_id)
-                    continue
-                seen.add(review.review_id)
-                reviews.append(review)
-                added += 1
-                LOG.info(
-                    "Collected review %d%s: id=%s author=%r rating=%s",
-                    len(reviews),
-                    f"/{max_reviews}" if max_reviews > 0 else "",
-                    review.review_id,
-                    review.author,
-                    review.rating,
-                )
-                if max_reviews > 0 and len(reviews) >= max_reviews:
-                    LOG.info("Reached max_reviews=%d", max_reviews)
-                    return [asdict(item) for item in reviews]
-            except StaleElementReferenceException:
-                stats["stale"] += 1
-                LOG.debug("Skipped stale review card: id=%s", review_id)
-                continue
-            except Exception as exc:
-                stats["parse_error"] += 1
-                LOG.warning("Parse error for review id=%s: %s", review_id, exc, exc_info=True)
-                continue
-
-        if added == 0 and cards:
-            LOG.info(
-                "No new reviews from %d visible card(s): missing_id=%d duplicate=%d "
-                "empty_after_parse=%d stale=%d parse_error=%d",
-                len(cards),
-                stats["missing_id"],
-                stats["duplicate"],
-                stats["empty_after_parse"],
-                stats["stale"],
-                stats["parse_error"],
-            )
-
-        if added == 0:
-            idle += 1
-        else:
-            idle = 0
-            
-        if idle >= 5:
-            LOG.info("Stopping reviews scrape after %d idle scrolls", idle)
-            break
-
-        # Check if scroll is stuck
-        if pane:
-            try:
-                current_scroll = driver.execute_script("return arguments[0].scrollTop;", pane)
-                if current_scroll == last_scroll_position and added == 0:
-                    scroll_stuck_count += 1
-                    LOG.warning("Scroll stuck at %dpx (stuck_count: %d)", current_scroll, scroll_stuck_count)
-                    
-                    if scroll_stuck_count > 5:
-                        LOG.warning("Scroll stuck - trying alternative method")
-                        try:
-                            driver.execute_script("arguments[0].lastElementChild.scrollIntoView();", pane)
-                            time.sleep(2)
-                        except Exception:
-                            pass
-                        scroll_stuck_count = 0
-                else:
-                    scroll_stuck_count = 0
-                    last_scroll_position = current_scroll
-            except Exception:
-                pass
-
-        # Perform scroll
-        try:
-            driver.execute_script(scroll_script)
-            # Extra scroll when no new reviews found
-            if added == 0:
-                time.sleep(0.5)
-                driver.execute_script("window.scrollBy(0, 500);")
-        except Exception as exc:
-            LOG.debug("Scroll error: %s", exc)
-            try:
-                driver.execute_script("window.scrollBy(0, 1200);")
-            except Exception:
-                pass
-        
-        # Dynamic sleep based on activity
-        if added > 5:
-            sleep_time = 0.7
-        elif added == 0:
-            sleep_time = 2.0
-        else:
-            sleep_time = 1.0
-        time.sleep(sleep_time)
-
-    LOG.info("Review scrape finished: collected=%d", len(reviews))
-    return [asdict(item) for item in reviews]
+    reviewer_info = str(payload.get("reviewerInfo") or "").strip()
+    review_match = re.search(r"([\d][\d\s,.]*)\s+reviews?", reviewer_info, re.I)
+    photo_match = re.search(r"([\d][\d\s,.]*)\s+photos?", reviewer_info, re.I)
+    photos: list[str] = []
+    for raw_url in payload.get("photos") or []:
+        photo_url = upscale_image_url(str(raw_url).strip(), scale=10)
+        if photo_url and photo_url not in photos:
+            photos.append(photo_url)
+    return Review(
+        review_id=review_id,
+        author=author,
+        rating=first_float(str(payload.get("ratingLabel") or "")),
+        text=str(payload.get("text") or "").strip(),
+        raw_date=str(payload.get("rawDate") or "").strip(),
+        likes=first_int(str(payload.get("likesText") or "")) or 0,
+        photos=photos,
+        profile_url=str(payload.get("profileUrl") or "").strip(),
+        profile_picture=upscale_image_url(
+            str(payload.get("profilePicture") or "").strip(), scale=10
+        ),
+        owner_text=str(payload.get("ownerText") or "").strip(),
+        reviewer_is_local_guide="local guide" in reviewer_info.casefold(),
+        reviewer_total_reviews=(first_int(review_match.group(1)) or 0) if review_match else 0,
+        reviewer_total_photos=(first_int(photo_match.group(1)) or 0) if photo_match else 0,
+    )
 
 
-def scrape_place(url: str, *, headless: bool, max_reviews: int, max_scrolls: int) -> dict[str, Any]:
+def _is_browser_crash(exc: BaseException) -> bool:
+    message = str(exc).casefold()
+    return any(signal in message for signal in (
+        "tab crashed",
+        "session deleted because of page crash",
+        "not connected to devtools",
+        "invalid session id",
+        "chrome not reachable",
+        "read timed out",
+        "timed out. (read timeout",
+        "connection refused",
+        "remote end closed connection",
+    ))
+
+
+# COMMENTED OUT DUE TO SCRAPE REVIEW ERRORS
+def scrape_reviews(
+    driver,
+    max_reviews: int,
+    max_scrolls: int,
+    *,
+    require_newest_sort: bool = False,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """DISABLED: Scrape reviews functionality has been disabled due to errors."""
+    LOG.warning("scrape_reviews is disabled - returning empty list")
+    return []
+
+
+def scrape_place(
+    url: str,
+    *,
+    headless: bool,
+    max_reviews: int,
+    max_scrolls: int,
+    include_reviews: bool = True,
+    reviews_with_images_only: bool = True,
+    require_newest_sort: bool = False,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     LOG.info("Starting place scrape: %s", url)
+    
+    # Validate URL format - skip invalid URLs
+    parsed = urlparse(url)
+    if "/place//" in url or parsed.path.endswith("/place/"):
+        LOG.error("Invalid place URL (missing place name): %s", url)
+        return {
+            "input_url": url,
+            "status": "failed",
+            "error": "Invalid URL format: missing place name in /place// path",
+            "blockedByGoogle": False,
+            "reviews": [],
+            "userReviews": [],
+            "reviews_count_output": 0,
+        }
+    
+    output_review_limit = normalize_max_reviews(max_reviews)
     driver = setup_driver(headless)
     try:
         resolved_url = navigate(driver, url)
+        # DISABLED: Limited view check removed since we only scrape place details now (not reviews)
+        # Limited view mainly affects review availability, but basic place data is still accessible
+        # if getattr(driver, "goroute_limited_view", False):
+        #     raise RuntimeError(
+        #         "Google Maps returned limited view; refusing to persist incomplete place details"
+        #     )
+        if getattr(driver, "goroute_limited_view", False):
+            LOG.warning("Limited view detected but continuing - place details may still be available")
         place = js_place_detail(driver, url, resolved_url)
-        place["status"] = "ok"
-        reviews_list = scrape_reviews(driver, max_reviews, max_scrolls)
-
-        # Re-extract per-star breakdown after reviews panel opens
-        apply_rating_summary(place, js_extract_rating_summary(driver), per_rating_only=True)
+        place["scrapeStatus"] = "ok"
+        reviews_list: list[dict[str, Any]] = []
+        # COMMENTED OUT DUE TO SCRAPE REVIEW ERRORS
+        # if include_reviews:
+        #     place_review_count = int(place.get("reviewCount") or place.get("review_count") or 0)
+        #     collection_limit = review_collection_limit(place_review_count, output_review_limit)
+        #     LOG.info(
+        #         "Review limits: place_review_count=%d collection_limit=%d output_limit=%d",
+        #         place_review_count,
+        #         collection_limit,
+        #         output_review_limit,
+        #     )
+        #     scraped_reviews = scrape_reviews(
+        #         driver,
+        #         collection_limit,
+        #         max_scrolls,
+        #         require_newest_sort=require_newest_sort,
+        #         cancel_requested=cancel_requested,
+        #     )
+        #     reviews_list = (
+        #         select_recent_reviews_with_images(scraped_reviews, output_review_limit)
+        #         if reviews_with_images_only
+        #         else scraped_reviews[:output_review_limit]
+        #     )
+        #
+        #     # Review data is already usable if the renderer dies after collection.
+        #     try:
+        #         apply_rating_summary(place, js_extract_rating_summary(driver), per_rating_only=True)
+        #     except Exception as exc:
+        #         LOG.warning("Could not refresh per-star breakdown after review scrape: %s", exc)
+        # else:
+        #     LOG.info("Skipping reviews; place-detail refresh mode")
+        LOG.info("Review scraping is DISABLED - skipping review collection")
         
         # Format reviews to match API requirements (camelCase fields)
         google_place_id = place.get("placeId", "") or place.get("place_id", "")
@@ -1535,6 +2884,7 @@ def scrape_place(url: str, *, headless: bool, max_reviews: int, max_scrolls: int
             "input_url": url,
             "status": "failed",
             "error": str(exc),
+            "blockedByGoogle": isinstance(exc, GoogleBlockedError),
             "reviews": [],
             "userReviews": [],  # Add alias here too
             "reviews_count_output": 0,
@@ -1542,9 +2892,31 @@ def scrape_place(url: str, *, headless: bool, max_reviews: int, max_scrolls: int
     finally:
         try:
             LOG.info("Closing browser")
-            driver.quit()
+            close_driver(driver)
         except Exception:
             pass
+
+
+# COMMENTED OUT DUE TO SCRAPE REVIEW ERRORS
+def scrape_place_reviews_only(
+    url: str,
+    *,
+    google_place_id: str,
+    headless: bool,
+    max_reviews: int,
+    max_scrolls: int,
+    require_newest_sort: bool = True,
+    cancel_requested: Callable[[], bool] | None = None,
+    driver=None,
+) -> dict[str, Any]:
+    """DISABLED: Scrape reviews only functionality has been disabled due to errors."""
+    LOG.warning("scrape_place_reviews_only is disabled - returning empty result")
+    return {
+        "scrapeStatus": "disabled",
+        "error": "Review scraping is currently disabled",
+        "reviews": [],
+        "placeId": google_place_id,
+    }
 
 
 def format_review_for_output(review_dict: dict[str, Any], google_place_id: str = "") -> dict[str, Any]:
@@ -1572,6 +2944,10 @@ def format_review_for_output(review_dict: dict[str, Any], google_place_id: str =
         "when": when_value,
         "images": review_dict.get("photos", []),
         "likes": review_dict.get("likes", 0),
+        "authenticityScore": review_dict.get(
+            "authenticity_score",
+            calculate_authenticity_score(review_dict),
+        ),
     }
 
 
@@ -1660,7 +3036,14 @@ def setup_logging(level: str, log_file: str | None) -> None:
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+        handlers.append(
+            RotatingFileHandler(
+                log_path,
+                maxBytes=10 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+        )
 
     logging.basicConfig(
         level=numeric_level,
@@ -1676,7 +3059,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--urls", required=True, help="Text file with one Google Maps URL per line.")
     parser.add_argument("--output", "-o", required=True, help="JSON output path.")
     parser.add_argument("--headless", action="store_true", help="Run browser in headless mode.")
-    parser.add_argument("--max-reviews", type=int, default=0, help="Max reviews per place. 0 means unlimited.")
+    parser.add_argument(
+        "--max-reviews",
+        type=int,
+        default=DEFAULT_MAX_REVIEWS,
+        help=f"Max reviews returned per place (cap {DEFAULT_MAX_REVIEWS}). 0 uses default.",
+    )
     parser.add_argument("--max-scrolls", type=int, default=80, help="Max review-pane scrolls per place.")
     parser.add_argument(
         "--log-level",

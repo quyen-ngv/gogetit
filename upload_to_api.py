@@ -10,13 +10,25 @@ from typing import Any
 from datetime import datetime, timedelta
 import re
 
+from config import goroute_api_headers
+
 try:
     import requests
     import urllib3
+
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError:
     print("ERROR: requests library not found. Install with: pip install requests")
     sys.exit(1)
+
+
+def _json_field_string(value: Any, empty_value: str) -> str:
+    """Serialize scraper JSON fields without changing their established DB shape."""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, str) and value.strip():
+        return value
+    return empty_value
 
 
 def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
@@ -69,16 +81,37 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
     destinations = place.get("destinations", [])
     if not isinstance(destinations, list):
         destinations = []
+
+    translations = place.get("translations")
+    if not isinstance(translations, dict):
+        translations = None
     
     # Convert other objects to JSON strings
-    open_hours = place.get("openHours", {})
-    open_hours_str = json.dumps(open_hours, ensure_ascii=False) if isinstance(open_hours, dict) else "{}"
-    
-    popular_times = place.get("popularTimes", {})
-    popular_times_str = json.dumps(popular_times, ensure_ascii=False) if isinstance(popular_times, dict) else "{}"
-    
-    raw_data = place.get("rawData", {})
-    raw_data_str = json.dumps(raw_data, ensure_ascii=False) if isinstance(raw_data, dict) else "{}"
+    open_hours_str = _json_field_string(place.get("openHours"), "{}")
+    regular_value = place.get("regular")
+    if regular_value is None:
+        raw_data = place.get("rawData")
+        if isinstance(raw_data, str):
+            try:
+                raw_data = json.loads(raw_data)
+            except (TypeError, ValueError):
+                raw_data = None
+        if isinstance(raw_data, dict):
+            opening_hours = raw_data.get("openingHours")
+            if isinstance(opening_hours, dict):
+                regular_value = opening_hours.get("regular")
+    if regular_value is None:
+        regular_value = place.get("openHours")
+    regular_str = _json_field_string(regular_value, "{}")
+    popular_times_str = _json_field_string(place.get("popularTimes"), "{}")
+    reservations_str = _json_field_string(place.get("reservations"), "{}")
+    order_online_str = _json_field_string(place.get("orderOnline"), "{}")
+    menu_str = _json_field_string(place.get("menu"), "{}")
+    complete_address_str = _json_field_string(place.get("completeAddress"), "{}")
+    about_str = _json_field_string(place.get("about"), "[]")
+    owner_str = _json_field_string(place.get("owner"), "{}")
+    emails_str = _json_field_string(place.get("emails"), "[]")
+    raw_data_str = _json_field_string(place.get("rawData"), "{}")
     
     # Determine placeGroup from category if not set
     place_group = place.get("placeGroup", "OTHER")
@@ -103,6 +136,7 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
         "cid": str(place.get("cid", "")) if place.get("cid") else "",
         "dataId": place.get("dataId", ""),
         "title": place.get("title") or place.get("name", ""),
+        "translations": translations,
         "category": place.get("category", ""),
         "placeGroup": place_group,
         "address": place.get("address", ""),
@@ -122,9 +156,18 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
         "userReviews": user_reviews_str,
         "descriptions": place.get("descriptions") or place.get("description", ""),
         "status": place.get("status", ""),
+        "visibilityStatus": place.get("visibilityStatus") or place.get("visibility_status"),
         "priceRange": place.get("priceRange") or place.get("price_range", ""),
         "openHours": open_hours_str,
+        "regular": regular_str,
         "popularTimes": popular_times_str,
+        "reservations": reservations_str,
+        "orderOnline": order_online_str,
+        "menu": menu_str,
+        "completeAddress": complete_address_str,
+        "about": about_str,
+        "owner": owner_str,
+        "emails": emails_str,
         "rawData": raw_data_str,
     }
     
@@ -132,47 +175,119 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in api_body.items() if v is not None}
 
 
-def upload_place(api_url: str, place_data: dict[str, Any], headers: dict[str, str]) -> bool:
-    """Upload a single place to the API."""
+def import_http_detailed(
+    api_url: str,
+    body: dict[str, Any],
+    *,
+    method: str = "POST",
+    headers: dict[str, str] | None = None,
+    timeout: int = 60,
+    idempotent_codes: tuple[str, ...] = (),
+    idempotent_statuses: tuple[int, ...] = (),
+) -> dict[str, Any]:
+    """Send JSON to an HTTP endpoint and return structured result."""
+    request_headers = goroute_api_headers(headers)
+    request_method = method.upper()
+
+    print(f"\n{'='*80}")
+    print(f"HTTP {request_method} {api_url}")
+    print(f"{'='*80}")
+    print(json.dumps(body, ensure_ascii=False, indent=2))
+    print(f"{'='*80}\n")
+
+    try:
+        response = requests.request(
+            request_method,
+            api_url,
+            headers=request_headers,
+            json=body,
+            timeout=timeout,
+            verify=False,
+        )
+        response_body = _safe_response_body(response)
+
+        if response.status_code in (200, 201):
+            print(f"✓ HTTP {response.status_code}")
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "response_body": response_body,
+            }
+
+        if _is_idempotent_response(
+            response.status_code,
+            response_body,
+            idempotent_codes=idempotent_codes,
+            idempotent_statuses=idempotent_statuses,
+        ):
+            print(f"✓ HTTP {response.status_code} (idempotent)")
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "response_body": response_body,
+                "idempotent": True,
+            }
+
+        print(f"✗ HTTP {response.status_code}")
+        print(f"   Error: {response_body}")
+        return {
+            "success": False,
+            "status_code": response.status_code,
+            "error": str(response_body),
+            "response_body": response_body,
+        }
+
+    except requests.exceptions.Timeout:
+        print(f"✗ Timeout (>{timeout}s)")
+        return {"success": False, "status_code": None, "error": f"Request timeout (>{timeout}s)"}
+    except Exception as exc:
+        print(f"✗ {str(exc)[:100]}")
+        return {"success": False, "status_code": None, "error": str(exc)}
+
+
+def _is_idempotent_response(
+    status_code: int,
+    response_body: Any,
+    *,
+    idempotent_codes: tuple[str, ...],
+    idempotent_statuses: tuple[int, ...],
+) -> bool:
+    if status_code not in idempotent_statuses:
+        return False
+
+    body_text = json.dumps(response_body, ensure_ascii=False) if isinstance(response_body, dict) else str(response_body)
+    markers = idempotent_codes + ("ALREADY_PROCESSED",)
+
+    if isinstance(response_body, dict):
+        code = str(response_body.get("code") or response_body.get("error") or response_body.get("status") or "")
+        if any(marker in code.upper() for marker in markers):
+            return True
+
+    return any(marker in body_text.upper() for marker in markers)
+
+
+def upload_place_detailed(
+    api_url: str,
+    place_data: dict[str, Any],
+    headers: dict[str, str],
+) -> dict[str, Any]:
+    """Upload a single place to the API and return structured result."""
     place_title = place_data.get("title", "Unknown")
     review_count = place_data.get("reviewCount", 0)
-    
-    # Log full request body
-    print(f"\n{'='*80}")
-    print(f"REQUEST BODY for: {place_title} ({review_count} reviews)")
-    print(f"{'='*80}")
-    print(json.dumps(place_data, ensure_ascii=False, indent=2))
-    print(f"{'='*80}\n")
-    
-    print(f"⏳ Uploading: {place_title}...", end=" ", flush=True)
-    
+    print(f"⏳ Uploading: {place_title} ({review_count} reviews)...", end=" ", flush=True)
+    return import_http_detailed(api_url, place_data, headers=headers)
+
+
+def _safe_response_body(response: requests.Response) -> Any:
     try:
-        response = requests.post(
-            api_url,
-            headers=headers,
-            json=place_data,
-            timeout=60,
-            verify=False
-        )
-        
-        if response.status_code in (200, 201):
-            print(f"✓")
-            return True
-        else:
-            print(f"✗ HTTP {response.status_code}")
-            try:
-                error_msg = response.json()
-                print(f"   Error: {error_msg}")
-            except:
-                print(f"   Response: {response.text[:200]}")
-            return False
-            
-    except requests.exceptions.Timeout:
-        print(f"✗ Timeout (>60s)")
-        return False
-    except Exception as e:
-        print(f"✗ {str(e)[:100]}")
-        return False
+        return response.json()
+    except ValueError:
+        return response.text[:500]
+
+
+def upload_place(api_url: str, place_data: dict[str, Any], headers: dict[str, str]) -> bool:
+    """Upload a single place to the API."""
+    return upload_place_detailed(api_url, place_data, headers)["success"]
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -8,6 +8,18 @@ python-telegram-bot>=20.0
 # HTTP requests
 requests>=2.31.0
 urllib3>=2.0.0
+yt-dlp[default,curl-cffi]>=2026.7.4
+gallery-dl>=1.32.1
+anthropic>=0.42.0
+faster-whisper>=1.1.0
+Pillow>=10.0.0
+
+# HTTP API server
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.0.0
+anyio>=4.5
+APScheduler>=3.10,<4.0
 
 # Data handling
 python-dateutil>=2.8.2

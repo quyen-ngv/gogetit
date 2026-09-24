@@ -14,23 +14,15 @@ import sys
 import time
 from datetime import datetime
 
-from run_job import scrape_place, setup_logging
+from config import GOROUTE_API_HEADERS, GOROUTE_API_URL
+from run_job import scrape_place, setup_logging, DEFAULT_MAX_REVIEWS
 from upload_to_api import format_place_for_api, upload_place as api_upload_place
 
-# Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
-# API configuration
-API_URL = "https://onestudy.id.vn/goroute/v1/api/places/import"
-API_HEADERS = {
-    "accept": "*/*",
-    "content-type": "application/json",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
 
 
 def load_urls(file_path: str) -> list[str]:
@@ -64,8 +56,8 @@ def process_url(url: str, idx: int, total: int) -> bool:
         place_data = scrape_place(
             url,
             headless=True,
-            max_reviews=500,  # Get up to 500 reviews (sorted by newest)
-            max_scrolls=100  # Increase scrolls to get more reviews
+            max_reviews=DEFAULT_MAX_REVIEWS,
+            max_scrolls=100,
         )
         
         if place_data.get("status") == "failed":
@@ -89,7 +81,7 @@ def process_url(url: str, idx: int, total: int) -> bool:
         
         try:
             api_data = format_place_for_api(place_data)
-            success = api_upload_place(API_URL, api_data, API_HEADERS)
+            success = api_upload_place(GOROUTE_API_URL, api_data, GOROUTE_API_HEADERS)
             
             if success:
                 logger.info(f"{prefix} Upload successful: {place_title} ({place_id})")
