@@ -40,6 +40,7 @@ COPY job_store.py .
 COPY contribution_import.py .
 COPY place_resolver.py .
 COPY place_searcher.py .
+COPY ai_call_log.py .
 COPY backend_place_search.py .
 COPY social_location_extractor.py .
 COPY social_eval.py .
