@@ -1532,6 +1532,111 @@ def _normalize_menu_items(items: Any, *, require_url: bool = False) -> list[dict
     return normalized
 
 
+GOOGLE_PHOTO_URL = re.compile(r"^https://lh\d+\.googleusercontent\.com/")
+GOOGLE_VIDEO_VARIANT = re.compile(r"=(m\d+|mm,[^=]*|\d+)$")
+# Indices into the place array (index 6) of Google's /maps/preview/place payload.
+PREVIEW_HERO_PHOTO_PATH = (72, 0, 0, 6, 0)
+PREVIEW_LOCAL_NAME_INDEX = 101
+
+
+def fetch_preview_place(driver) -> list[Any] | None:
+    """Re-read the /maps/preview/place payload the open place page requested.
+
+    With PLACE_BROWSER_BLOCK_IMAGES on, Maps never mounts the hero or photo-pack
+    <img> tags (it injects them only after the image has loaded), so photo URLs are
+    taken from this payload instead. It also carries the native-language name.
+    """
+    try:
+        body = driver.execute_async_script(
+            """
+            const done = arguments[arguments.length - 1];
+            const entries = performance.getEntriesByType('resource')
+              .map((entry) => entry.name)
+              .filter((name) => name.includes('/maps/preview/place?'));
+            if (!entries.length) { done(''); return; }
+            const controller = new AbortController();
+            setTimeout(() => controller.abort(), 15000);
+            fetch(entries[entries.length - 1], {credentials: 'include', signal: controller.signal})
+              .then((response) => response.ok ? response.text() : '')
+              .then(done, () => done(''));
+            """
+        )
+    except Exception as exc:
+        LOG.warning("Could not re-read the Maps preview payload: %s", exc)
+        return None
+    if not body or "\n" not in body:
+        LOG.info("Maps preview payload unavailable")
+        return None
+    try:
+        # The body starts with the XSSI guard line )]}'
+        payload = json.loads(body.split("\n", 1)[1])
+    except ValueError:
+        LOG.warning("Maps preview payload is not JSON")
+        return None
+    place = payload[6] if isinstance(payload, list) and len(payload) > 6 else None
+    return place if isinstance(place, list) else None
+
+
+def _nested(value: Any, path: tuple[int, ...]) -> Any:
+    for index in path:
+        if not isinstance(value, list) or index >= len(value):
+            return None
+        value = value[index]
+    return value
+
+
+def _is_place_photo_url(value: Any) -> bool:
+    # /a/ and /a-/ are profile avatars (reviewers, owners), not place photos.
+    # A video item lists its stream variants (=m18, =m37, =mm,dash, =750000)
+    # next to its poster frame; only the poster is a photo.
+    return (
+        isinstance(value, str)
+        and bool(GOOGLE_PHOTO_URL.match(value))
+        and "/a/" not in value
+        and "/a-/" not in value
+        and not GOOGLE_VIDEO_VARIANT.search(value)
+    )
+
+
+def preview_place_media(place: list[Any] | None) -> dict[str, Any]:
+    """Pull the cover photo, gallery photos and native name out of a preview payload."""
+    if not place:
+        return {"hero": "", "photos": [], "localTitle": ""}
+    hero = _nested(place, PREVIEW_HERO_PHOTO_PATH)
+    photos: list[str] = []
+    seen: set[str] = set()
+
+    def walk(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif _is_place_photo_url(value):
+            base = value.split("=", 1)[0]
+            if base not in seen:
+                seen.add(base)
+                photos.append(value)
+
+    walk(place)
+    local_title = place[PREVIEW_LOCAL_NAME_INDEX] if len(place) > PREVIEW_LOCAL_NAME_INDEX else None
+    return {
+        "hero": hero if _is_place_photo_url(hero) else "",
+        "photos": photos,
+        "localTitle": local_title.strip() if isinstance(local_title, str) else "",
+    }
+
+
+def build_title_translations(title: str, local_title: str, in_vietnam: bool) -> dict[str, dict[str, str]] | None:
+    """Map Google's English title and the native (Vietnamese) name to locales.
+
+    The backend stores `vi` as the default locale and, without an explicit map,
+    copies the English title into it. Only Vietnamese places get `vi` from the
+    native name; a place abroad shows e.g. a French native name there.
+    """
+    if not in_vietnam or not local_title or local_title.casefold() == title.casefold():
+        return None
+    return {"vi": {"name": local_title}, "en": {"name": title}}
+
+
 def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]:
     LOG.info("Extracting place detail")
     lat, lng = extract_coords(resolved_url)
@@ -1542,7 +1647,8 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
     # Google lazily mounts hours, popular-times, owner and contact rows while the
     # place pane scrolls. Load the full Overview before reading any field.
     _scroll_main_panel(driver, max_steps=14)
-    
+    preview_media = preview_place_media(fetch_preview_place(driver))
+
     raw = driver.execute_script(
         r"""
         const text = (el) => (el && el.textContent || '').trim();
@@ -1748,6 +1854,8 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         return {
           placeIdFromPage: getPlaceIdFromPage(),
           title: pickText(['h1.DUwDvf', 'h1']),
+          // Native-language name under the English h1, e.g. "Hồ Hoàn Kiếm".
+          localTitle: pickText(['div.lMbq3e h2.bwoZTb', 'h2.bwoZTb']),
           category: pickText(['button.DkEaL', 'button[jsaction*="category"]']),
           categories,
           address: prefixedValue(address, ['Address', 'Địa chỉ']),
@@ -1862,17 +1970,33 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         place_id,
     )
     
-    # Upscale thumbnail and images; prepend thumbnail as first gallery item
-    thumbnail = upscale_image_url(raw.get("thumbnail", ""), scale=10)
-    images = raw.get("images", []) or []
+    local_title = str(raw.get("localTitle") or preview_media["localTitle"] or "").strip()
+    if local_title.casefold() == title.casefold():
+        local_title = ""
+    in_vietnam = timezone == "Asia/Saigon" or bool(
+        re.search(r"\b(vietnam|việt nam)\b", str(raw.get("address") or ""), re.IGNORECASE)
+    )
+    translations = build_title_translations(title, local_title, in_vietnam)
+
+    # Upscale thumbnail and images; prepend thumbnail as first gallery item.
+    # With image loading blocked the DOM has no hero or photo-pack <img>, so the
+    # preview payload supplies both; DOM photos keep their place when present.
+    # The DOM, when it renders photos at all, shows the same ones under different
+    # URL tokens, so the two sources are never merged: that would duplicate them.
+    if preview_media["photos"]:
+        thumbnail = preview_media["hero"] or raw.get("thumbnail", "")
+        images = [{"title": "", "image": url} for url in preview_media["photos"]]
+    else:
+        thumbnail = raw.get("thumbnail", "")
+        images = raw.get("images", []) or []
+    thumbnail = upscale_image_url(thumbnail, scale=10)
     for img in images:
         if isinstance(img, dict) and "image" in img:
             img["image"] = upscale_image_url(img["image"], scale=10)
 
-    # Google does not render a hero-header button on every place, and the pane
-    # is already scrolled past the header by the time this reads the DOM. The
-    # first gallery photo is that same cover image, so fall back to it rather
-    # than importing a place with no cover at all.
+    # Google does not render a hero-header button on every place, and the
+    # preview payload can be missing. The first gallery photo is normally that
+    # same cover image, so fall back to it rather than importing no cover.
     if not thumbnail:
         thumbnail = next(
             (
@@ -1952,6 +2076,7 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         "source": "google_maps_web",
         "sourceLocale": "en",
         "scrapedAt": now_iso(),
+        "localTitle": local_title,
         "openingHours": {
             "regular": open_hours,
             "secondary": secondary_open_hours,
@@ -1976,6 +2101,8 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         "googleMapsLink": google_maps_link,
         "title": title,
         "name": title,
+        "localTitle": local_title,
+        "translations": translations,
         "category": category,
         "placeGroup": place_group,
         "categories": categories,

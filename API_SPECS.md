@@ -70,6 +70,7 @@ sequenceDiagram
 | `PLACE_REFRESH_MINUTE` | `0` | Daily refresh minute |
 | `PLACE_REFRESH_TIMEZONE` | `Asia/Bangkok` | Scheduler timezone |
 | `PLACE_REFRESH_MAX_PLACES` | `0` | Scheduled run cap; `0` means all eligible places |
+| `PLACE_REFRESH_BLOCK_BACKOFF_SECONDS` | `60,300,900` | Waits before the next place after the 2nd, 3rd, ... place in a row blocked by Google's bot-check page. A single blocked place is counted failed and skipped with no wait; one more block after the last wait stops the batch |
 | `PLACE_REFRESH_API_KEY` | empty | Optional `X-API-Key` required by maintenance endpoints |
 
 ---
@@ -230,6 +231,7 @@ Image sampling/compression:
 - `image_jpeg_quality=12` uses FFmpeg `-q:v 12`; lower is larger/better quality, higher is smaller/lower quality.
 - Place extraction has no candidate-count quota. Policy `AI_EVIDENCE_JUDGE_V2` makes the AI classify identity confidence and evidence type; Python applies schema/evidence guardrails, fuzzy transcript validation, deduplication, and Maps ambiguity checks.
 - Async jobs publish an accumulated result after each Maps-enriched candidate with callback status `PROCESSING`; only the final callback uses `COMPLETED`.
+- Async jobs (`POST /api/v1/social-location/jobs`) also accept `map_search_provider` (`SCRAPE` default, or `GOOGLE`) and `map_search_url`. With `GOOGLE` and a URL, each Maps lookup is `POST {map_search_url}` with body `{"query": ..., "limit": ...}` and header `X-Internal-Token: <callback_token>`; the backend answers `{"data": {"success": true, "candidates": [...]}}` in the same candidate shape as the browser search. Any backend failure falls back to the browser search for that place (`backend_place_search.py`). The sync `/extract` endpoint always uses the browser.
 
 Response shape:
 

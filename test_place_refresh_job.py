@@ -125,29 +125,89 @@ class PlaceRefreshJobTest(unittest.TestCase):
         self.assertEqual(report["processedCount"], 0)
         scrape_mock.assert_not_called()
 
+    @staticmethod
+    def _scrape_result(*, blocked):
+        result = Mock()
+        result.success = not blocked
+        result.blocked_by_google = blocked
+        result.to_dict.return_value = {"success": not blocked, "blockedByGoogle": blocked}
+        return result
+
+    @staticmethod
+    def _places(*ids):
+        return [{"id": place_id, "googleMapsLink": f"https://www.google.com/maps/place/{place_id}"} for place_id in ids], len(ids)
+
+    @patch("place_refresh_job.time.sleep")
+    @patch("place_refresh_job.PLACE_REFRESH_BLOCK_BACKOFF_SECONDS", (60.0,))
     @patch("place_refresh_job.scrape_and_import")
     @patch("place_refresh_job.fetch_place_refresh_candidates")
-    def test_refresh_stops_the_whole_batch_when_google_blocks_the_ip(self, fetch_mock, scrape_mock):
-        fetch_mock.return_value = (
-            [
-                {"id": "blocked-place", "googleMapsLink": "https://www.google.com/maps/place/One"},
-                {"id": "never-reached", "googleMapsLink": "https://www.google.com/maps/place/Two"},
-            ],
-            2,
-        )
-        blocked_result = Mock()
-        blocked_result.success = False
-        blocked_result.blocked_by_google = True
-        blocked_result.to_dict.return_value = {"success": False, "blockedByGoogle": True}
-        scrape_mock.return_value = blocked_result
+    def test_a_lone_blocked_place_is_skipped_without_waiting(self, fetch_mock, scrape_mock, sleep_mock):
+        fetch_mock.return_value = self._places("blocked", "next")
+        scrape_mock.side_effect = [self._scrape_result(blocked=True), self._scrape_result(blocked=False)]
 
-        report = run_place_detail_refresh()
+        report = run_place_detail_refresh(delay_seconds=0)
+
+        self.assertTrue(report["success"])
+        self.assertEqual(report["processedCount"], 2)
+        self.assertEqual(report["successCount"], 1)
+        self.assertEqual(report["failedCount"], 1)
+        self.assertEqual(
+            [call.args[0].rsplit("/", 1)[-1] for call in scrape_mock.call_args_list], ["blocked", "next"]
+        )
+        sleep_mock.assert_not_called()
+
+    @patch("place_refresh_job.time.sleep")
+    @patch("place_refresh_job.PLACE_REFRESH_BLOCK_BACKOFF_SECONDS", (60.0,))
+    @patch("place_refresh_job.scrape_and_import")
+    @patch("place_refresh_job.fetch_place_refresh_candidates")
+    def test_blocks_in_a_row_back_off_before_moving_to_the_next_place(self, fetch_mock, scrape_mock, sleep_mock):
+        fetch_mock.return_value = self._places("one", "two", "three")
+        scrape_mock.side_effect = [
+            self._scrape_result(blocked=True),
+            self._scrape_result(blocked=True),
+            self._scrape_result(blocked=False),
+        ]
+
+        report = run_place_detail_refresh(delay_seconds=0)
+
+        self.assertTrue(report["success"])
+        self.assertEqual(report["processedCount"], 3)
+        self.assertEqual(report["failedCount"], 2)
+        self.assertEqual(scrape_mock.call_count, 3)
+        self.assertAlmostEqual(sum(call.args[0] for call in sleep_mock.call_args_list), 60.0, delta=1.0)
+
+    @patch("place_refresh_job.time.sleep")
+    @patch("place_refresh_job.PLACE_REFRESH_BLOCK_BACKOFF_SECONDS", (60.0,))
+    @patch("place_refresh_job.scrape_and_import")
+    @patch("place_refresh_job.fetch_place_refresh_candidates")
+    def test_cancel_during_a_block_backoff_ends_the_job_as_cancelled(self, fetch_mock, scrape_mock, sleep_mock):
+        fetch_mock.return_value = self._places("one", "two", "three")
+        scrape_mock.return_value = self._scrape_result(blocked=True)
+        cancel_checks = iter([False, False, False, True])
+
+        report = run_place_detail_refresh(delay_seconds=0, cancel_requested=lambda: next(cancel_checks, True))
+
+        self.assertTrue(report["cancelled"])
+        self.assertEqual(report["processedCount"], 2)
+        self.assertEqual(scrape_mock.call_count, 2)
+
+    @patch("place_refresh_job.time.sleep")
+    @patch("place_refresh_job.PLACE_REFRESH_BLOCK_BACKOFF_SECONDS", (60.0,))
+    @patch("place_refresh_job.scrape_and_import")
+    @patch("place_refresh_job.fetch_place_refresh_candidates")
+    def test_refresh_stops_the_batch_when_places_stay_blocked_through_every_backoff(
+        self, fetch_mock, scrape_mock, sleep_mock
+    ):
+        fetch_mock.return_value = self._places("one", "two", "three", "never-reached")
+        scrape_mock.return_value = self._scrape_result(blocked=True)
+
+        report = run_place_detail_refresh(delay_seconds=0)
 
         self.assertFalse(report["success"])
         self.assertTrue(report["blockedByGoogle"])
-        self.assertEqual(report["processedCount"], 1)
-        scrape_mock.assert_called_once()
-
+        self.assertEqual(report["processedCount"], 3)
+        self.assertEqual(report["failedCount"], 3)
+        self.assertEqual(scrape_mock.call_count, 3)
 
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,14 @@ PLACE_REFRESH_MINUTE = int(os.getenv("PLACE_REFRESH_MINUTE", "0"))
 PLACE_REFRESH_TIMEZONE = os.getenv("PLACE_REFRESH_TIMEZONE", "Asia/Bangkok")
 PLACE_REFRESH_MAX_PLACES = int(os.getenv("PLACE_REFRESH_MAX_PLACES", "0"))
 PLACE_REFRESH_DELAY_SECONDS = float(os.getenv("PLACE_REFRESH_DELAY_SECONDS", "5"))
+# Waits (seconds) before the next place after the 2nd, 3rd, ... place in a row that hit
+# Google's bot-check page. A single blocked place is skipped with no wait; one more block
+# after the last wait stops the batch.
+PLACE_REFRESH_BLOCK_BACKOFF_SECONDS = tuple(
+    float(value)
+    for value in os.getenv("PLACE_REFRESH_BLOCK_BACKOFF_SECONDS", "60,300,900").split(",")
+    if value.strip()
+)
 PLACE_REFRESH_API_KEY = os.getenv("PLACE_REFRESH_API_KEY", "")
 
 PLACE_REVIEW_REFRESH_ENABLED = os.getenv("PLACE_REVIEW_REFRESH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -110,7 +118,11 @@ AI_REQUEST_TIMEOUT_SECONDS = int(os.getenv("AI_REQUEST_TIMEOUT_SECONDS", "120"))
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-6-luna")
+# Only sent to OpenAI reasoning-capable models (o-series, gpt-5+). Empty means
+# "none" where the model accepts it (gpt-5.1+, gpt-6), else "low". The API
+# default ("medium") made the social extraction call take ~110s against a 120s timeout.
+SOCIAL_AI_REASONING_EFFORT = os.getenv("SOCIAL_AI_REASONING_EFFORT", "").strip().lower()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3-turbo")
@@ -124,6 +136,10 @@ LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "cpu")
 LOCAL_WHISPER_COMPUTE_TYPE = os.getenv("LOCAL_WHISPER_COMPUTE_TYPE", "int8")
 LOCAL_WHISPER_LANGUAGE = os.getenv("LOCAL_WHISPER_LANGUAGE", "vi")
 LOCAL_WHISPER_CACHE_DIR = os.getenv("LOCAL_WHISPER_CACHE_DIR", "")
+# Greedy decoding (1) is ~2-3x faster on CPU than faster-whisper's default beam of 5.
+LOCAL_WHISPER_BEAM_SIZE = max(1, int(os.getenv("LOCAL_WHISPER_BEAM_SIZE", "1")))
+# 0 lets CTranslate2 pick, which counts host cores, not the container's CPU quota (1.5).
+LOCAL_WHISPER_CPU_THREADS = max(0, int(os.getenv("LOCAL_WHISPER_CPU_THREADS", "2")))
 
 SOCIAL_YTDLP_COOKIE_FILE = os.getenv("SOCIAL_YTDLP_COOKIE_FILE", "/app/cookies.txt").strip()
 SOCIAL_YTDLP_IMPERSONATE = os.getenv("SOCIAL_YTDLP_IMPERSONATE", "chrome").strip()

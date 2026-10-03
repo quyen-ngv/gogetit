@@ -12,6 +12,7 @@ import requests
 from config import (
     GOROUTE_API_HEADERS,
     GOROUTE_PLACES_URL,
+    PLACE_REFRESH_BLOCK_BACKOFF_SECONDS,
     PLACE_REFRESH_DELAY_SECONDS,
     goroute_api_headers,
 )
@@ -110,6 +111,18 @@ def _place_overrides(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _wait_unless_cancelled(seconds: float, cancel_requested: CancelRequested | None) -> bool:
+    """Sleep in short steps so a cancel lands within seconds; False means cancelled."""
+    remaining = seconds
+    while remaining > 0:
+        if cancel_requested and cancel_requested():
+            return False
+        step = min(5.0, remaining)
+        time.sleep(step)
+        remaining -= step
+    return not (cancel_requested and cancel_requested())
+
+
 def run_place_detail_refresh(
     *,
     place_id: str | None = None,
@@ -131,6 +144,7 @@ def run_place_detail_refresh(
     results: list[dict[str, Any]] = []
     success_count = 0
     failed_count = 0
+    consecutive_blocks = 0
 
     def report(current: int, current_place: dict[str, Any] | None = None) -> None:
         if progress_callback is None:
@@ -147,19 +161,22 @@ def run_place_detail_refresh(
             }
         )
 
+    def cancelled_report() -> dict[str, Any]:
+        return {
+            "success": False,
+            "cancelled": True,
+            "databaseCount": database_count,
+            "eligibleCount": total,
+            "processedCount": len(results),
+            "successCount": success_count,
+            "failedCount": failed_count,
+            "results": results,
+        }
+
     report(0)
     for index, candidate in enumerate(candidates, start=1):
         if cancel_requested and cancel_requested():
-            return {
-                "success": False,
-                "cancelled": True,
-                "databaseCount": database_count,
-                "eligibleCount": total,
-                "processedCount": len(results),
-                "successCount": success_count,
-                "failedCount": failed_count,
-                "results": results,
-            }
+            return cancelled_report()
         url = str(candidate.get("googleMapsLink") or "").strip()
         logger.info(
             "Refreshing place details %d/%d: id=%s title=%r",
@@ -208,12 +225,18 @@ def run_place_detail_refresh(
         results.append(item)
         report(index, candidate)
         if result is not None and result.blocked_by_google:
-            # Google's IP-level block applies to every remaining candidate too; burning
-            # through the rest of the batch right now only prolongs the block instead of
-            # letting it clear.
+            consecutive_blocks += 1
+        elif result is not None:
+            consecutive_blocks = 0
+        # A lone /sorry is tied to that place's URL, not the IP: the same place stays
+        # blocked across hours while other links (and the Telegram bot) scrape fine. So
+        # the place is counted failed and the batch moves on; only a run of different
+        # places all blocked means the IP itself is blocked, and that earns a backoff.
+        if consecutive_blocks > len(PLACE_REFRESH_BLOCK_BACKOFF_SECONDS) + 1:
             logger.error(
-                "Google blocked this IP (bot-check page); stopping the batch at %d/%d "
-                "instead of continuing to hammer it while blocked.",
+                "Google blocked %d places in a row (bot-check page) through every backoff "
+                "wait; stopping the batch at %d/%d instead of continuing to hammer it.",
+                consecutive_blocks,
                 index,
                 total,
             )
@@ -227,7 +250,16 @@ def run_place_detail_refresh(
                 "failedCount": failed_count,
                 "results": results,
             }
-        if delay_seconds > 0 and index < total:
+        if consecutive_blocks >= 2 and index < total:
+            wait_seconds = PLACE_REFRESH_BLOCK_BACKOFF_SECONDS[consecutive_blocks - 2]
+            logger.warning(
+                "Google blocked %d places in a row; waiting %.0fs before the next place",
+                consecutive_blocks,
+                wait_seconds,
+            )
+            if not _wait_unless_cancelled(wait_seconds, cancel_requested):
+                return cancelled_report()
+        elif delay_seconds > 0 and index < total:
             time.sleep(delay_seconds)
 
     return {

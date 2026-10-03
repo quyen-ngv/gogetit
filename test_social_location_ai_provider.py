@@ -1,7 +1,9 @@
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import social_location_extractor as extractor
 
@@ -90,6 +92,111 @@ class SocialLocationAiProviderTest(unittest.TestCase):
         self.assertIn("json", serialized_messages)
         self.assertIn("valid json object", serialized_messages)
 
+    def test_openai_reasoning_model_gets_effort_and_room_to_answer(self):
+        with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+            extractor.requests, "post", return_value=_FakeResponse()
+        ) as post:
+            extractor.extract_candidates_with_ai(
+                metadata={"title": "Travel"},
+                transcript="Cafe Giang in Hanoi",
+                transcript_provider="test",
+                image_paths=[],
+                language="vi",
+                ai_provider="openai",
+                ai_model="gpt-5-mini",
+                ai_base_url="https://api.openai.com/v1",
+            )
+
+        request_json = post.call_args.kwargs["json"]
+        self.assertEqual("low", request_json["reasoning_effort"])
+        self.assertGreater(request_json["max_completion_tokens"], 8000)
+
+    def test_extraction_reasons_a_little_and_the_prefilter_not_at_all(self):
+        for model in ("gpt-6-luna", "gpt-5.4-mini"):
+            with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+                extractor.requests, "post", return_value=_FakeResponse()
+            ) as post:
+                extractor.extract_candidates_with_ai(
+                    metadata={"title": "Travel"},
+                    transcript="Cafe Giang in Hanoi",
+                    transcript_provider="test",
+                    image_paths=[],
+                    language="vi",
+                    ai_provider="openai",
+                    ai_model=model,
+                    ai_base_url="https://api.openai.com/v1",
+                )
+
+            self.assertEqual("low", post.call_args.kwargs["json"]["reasoning_effort"], model)
+            self.assertEqual("none", extractor._openai_reasoning_effort(model), model)
+
+    def test_openai_non_reasoning_model_gets_no_reasoning_effort(self):
+        with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+            extractor.requests, "post", return_value=_FakeResponse()
+        ) as post:
+            extractor.extract_candidates_with_ai(
+                metadata={"title": "Travel"},
+                transcript="Cafe Giang in Hanoi",
+                transcript_provider="test",
+                image_paths=[],
+                language="vi",
+                ai_provider="openai",
+                ai_model="gpt-4.1-mini",
+                ai_base_url="https://api.openai.com/v1",
+            )
+
+        request_json = post.call_args.kwargs["json"]
+        self.assertNotIn("reasoning_effort", request_json)
+        self.assertEqual(16000, request_json["max_completion_tokens"])
+
+    def test_empty_ai_content_reports_why_instead_of_a_json_error(self):
+        response = _FakeResponse()
+        response.json = lambda: {
+            "usage": {
+                "prompt_tokens": 9000,
+                "completion_tokens": 8000,
+                "completion_tokens_details": {"reasoning_tokens": 8000},
+            },
+            "choices": [{"finish_reason": "length", "message": {"content": ""}}],
+        }
+        with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+            extractor.requests, "post", return_value=response
+        ):
+            with self.assertRaisesRegex(ValueError, "finish_reason=length.*reasoning_tokens=8000"):
+                extractor.extract_candidates_with_ai(
+                    metadata={"title": "Travel"},
+                    transcript="Cafe Giang in Hanoi",
+                    transcript_provider="test",
+                    image_paths=[],
+                    language="vi",
+                    ai_provider="openai",
+                    ai_model="gpt-5-mini",
+                    ai_base_url="https://api.openai.com/v1",
+                )
+
+    def test_topic_prefilter_sends_no_temperature_to_reasoning_model(self):
+        response = _FakeResponse()
+        response.json = lambda: {
+            "usage": {"prompt_tokens": 40, "completion_tokens": 300},
+            "choices": [{"message": {"content": '{"clearly_unrelated": false, "reason": "cafe"}'}}],
+        }
+        with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+            extractor.requests, "post", return_value=response
+        ) as post:
+            extractor.prefilter_topic_relevance(
+                metadata={"title": "Cafe hopping"},
+                transcript="This cafe in Hanoi is great",
+                language="vi",
+                ai_provider="openai",
+                ai_model="gpt-5-mini",
+                ai_base_url="https://api.openai.com/v1",
+            )
+
+        request_json = post.call_args.kwargs["json"]
+        self.assertNotIn("temperature", request_json)
+        self.assertEqual("low", request_json["reasoning_effort"])
+        self.assertGreater(request_json["max_completion_tokens"], 120)
+
     def test_prompt_assigns_identity_judgement_to_ai(self):
         with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
             extractor.requests, "post", return_value=_FakeResponse()
@@ -116,6 +223,38 @@ class SocialLocationAiProviderTest(unittest.TestCase):
         self.assertNotIn("Return at most", prompt)
         self.assertIn("entire transcript and every supplied frame/slide", prompt)
         self.assertIn("Never merge multiple explicitly named list items", prompt)
+
+    def test_prompt_asks_for_planner_voice_trip_title_and_description(self):
+        with patch.object(extractor, "OPENAI_API_KEY", "test-secret"), patch.object(
+            extractor.requests, "post", return_value=_FakeResponse()
+        ) as post:
+            extractor.extract_candidates_with_ai(
+                metadata={"title": "Da Lat 3N2D #dalat"},
+                transcript="Ngày 1 đi Quán Cà Phê Mộc",
+                transcript_provider="test",
+                image_paths=[],
+                language="vi",
+                ai_provider="openai",
+                ai_model="gpt-6-luna",
+                ai_base_url="https://api.openai.com/v1",
+            )
+
+        prompt = post.call_args.kwargs["json"]["messages"][1]["content"][0]["text"]
+        self.assertIn("\"trip_title\"", prompt)
+        self.assertIn("\"trip_description\"", prompt)
+        self.assertIn("Never refer to the source", prompt)
+        self.assertIn("Not the video's title", prompt)
+        self.assertNotIn("concise recap of what this video says", prompt)
+
+    def test_trip_title_and_description_survive_normalisation(self):
+        parsed = extractor._normalize_extraction_payload({
+            "trip_title": "  Đà Lạt 3 ngày săn mây  ",
+            "trip_description": "Đi giữa tuần để tránh đông.",
+            "candidates": [],
+        })
+        self.assertEqual("Đà Lạt 3 ngày săn mây", parsed["trip_title"])
+        self.assertEqual("Đi giữa tuần để tránh đông.", parsed["trip_description"])
+        self.assertIsNone(extractor._normalize_extraction_payload({"candidates": []})["trip_title"])
 
     def test_named_mentions_are_kept_even_when_evidence_is_unresolved(self):
         extraction = {
@@ -453,7 +592,7 @@ class SocialLocationAiProviderTest(unittest.TestCase):
     def test_tiktok_photo_download_failure_does_not_fall_through_to_video(self):
         error = RuntimeError("SOCIAL_CAROUSEL_DOWNLOAD_BLOCKED: carousel blocked")
         with patch.object(extractor, "download_carousel_images", side_effect=error), patch.object(
-            extractor, "extract_metadata"
+            extractor, "fetch_video"
         ) as video_metadata:
             result = extractor.extract_social_location("https://www.tiktok.com/@user/photo/123")
 
@@ -517,7 +656,7 @@ class SocialLocationAiProviderTest(unittest.TestCase):
             extractor, "extract_carousel_metadata", return_value={"extractor_key": "TikTok", "title": "Trip"}
         ), patch.object(
             extractor, "complete_carousel_extraction", return_value=carousel_result
-        ) as complete, patch.object(extractor, "extract_metadata") as video_metadata, patch.object(
+        ) as complete, patch.object(extractor, "fetch_video") as video_metadata, patch.object(
             extractor, "extract_audio"
         ) as extract_audio:
             result = extractor.extract_social_location("https://www.tiktok.com/@user/photo/123")
@@ -617,9 +756,7 @@ class SocialLocationAiProviderTest(unittest.TestCase):
             with patch.object(
                 extractor, "download_carousel_images", return_value=[]
             ), patch.object(
-                extractor, "extract_metadata", return_value=(info, "default")
-            ), patch.object(
-                extractor, "download_media", return_value=media_path
+                extractor, "fetch_video", return_value=(info, "default", media_path)
             ), patch.object(
                 extractor, "extract_audio", return_value=None
             ), patch.object(
@@ -632,21 +769,26 @@ class SocialLocationAiProviderTest(unittest.TestCase):
                     "usage": {"inputTokens": 80, "outputTokens": 10, "totalTokens": 90},
                 },
             ) as prefilter, patch.object(
-                extractor, "extract_frames"
+                extractor, "extract_frames", return_value=[]
             ) as extract_frames, patch.object(
                 extractor, "extract_candidates_with_ai"
-            ) as extract_candidates:
+            ) as extract_candidates, self.assertLogs(extractor.LOG, level="INFO") as logs:
                 result = extractor.extract_social_location(
                     "https://www.tiktok.com/@user/video/123"
                 )
 
+        timing_lines = [line for line in logs.output if "Social extraction timing" in line]
+        self.assertEqual(1, len(timing_lines))
+        for step in ("frames", "audio", "prefilter"):
+            self.assertIn(f'"{step}"', timing_lines[0])
         self.assertFalse(result["success"])
         self.assertEqual("REJECTED_TOPIC", result["rejectedStatus"])
         self.assertEqual("IRRELEVANT_SOCIAL_VIDEO", result["error"]["code"])
         self.assertEqual("Pure dance trend, no place mentioned", result["error"]["message"])
         self.assertEqual(0, result["media"]["frameCount"])
         prefilter.assert_called_once()
-        extract_frames.assert_not_called()
+        # Frames are cut while the transcript is made, but the vision call is still skipped.
+        extract_frames.assert_called_once()
         extract_candidates.assert_not_called()
 
     def test_dedupe_near_identical_frames_drops_static_run(self):
@@ -677,10 +819,230 @@ class SocialLocationAiProviderTest(unittest.TestCase):
 
         self.assertEqual([paths[0], paths[3]], kept)
 
+    def test_dedupe_keeps_a_frame_whose_only_change_is_a_title_over_the_same_scene(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            paths = [Path(temp_dir) / f"frame_{index}.jpg" for index in range(3)]
+            for index, path in enumerate(paths):
+                image = Image.new("RGB", (448, 796), (60, 140, 60))
+                if index == 2:
+                    ImageDraw.Draw(image).rectangle([120, 150, 330, 190], fill="white")  # "3. Cây cô đơn"
+                image.save(path, "JPEG")
+
+            kept = extractor.dedupe_near_identical_frames(paths)
+
+        self.assertEqual([paths[0], paths[2]], kept)
+
     def test_dedupe_near_identical_frames_keeps_short_lists_untouched(self):
         paths = [Path("a.jpg"), Path("b.jpg")]
         self.assertEqual(paths, extractor.dedupe_near_identical_frames(paths))
 
+
+class ProgressiveLocationTest(unittest.TestCase):
+    def test_every_place_is_reported_before_any_map_lookup(self):
+        extraction = {
+            "candidates": [
+                {"candidateRef": "a", "name": "The Workshop", "query": "The Workshop Saigon"},
+                {"candidateRef": "b", "name": "Cafe Giang", "query": "Cafe Giang Hanoi"},
+            ]
+        }
+        reports = []
+        search_calls_at_report = []
+        search = Mock(side_effect=[
+            {"success": True, "count": 1, "candidates": [{"placeId": "one", "title": "The Workshop"}]},
+            {"success": True, "count": 1, "candidates": [{"placeId": "two", "title": "Cafe Giang"}]},
+        ])
+
+        def record(payload):
+            reports.append(payload)
+            search_calls_at_report.append(search.call_count)
+
+        with patch.object(extractor, "search_google_maps", search):
+            extractor.locate_candidates_progressively(
+                extraction,
+                base_payload={"url": "https://tiktok.com/x"},
+                preview_images={"a": {"contentType": "image/jpeg", "data": "AAAA"}},
+                search_limit=1,
+                headless=True,
+                progress_callback=record,
+            )
+
+        first = reports[0]["extraction"]["candidates"]
+        self.assertEqual(0, search_calls_at_report[0])
+        self.assertEqual("LOCATING", reports[0]["progress"]["stage"])
+        self.assertEqual(["PENDING", "PENDING"], [item["mapSearchStatus"] for item in first])
+        self.assertEqual("AAAA", first[0]["previewImage"]["data"])
+        self.assertNotIn("previewImage", first[1])
+
+        # Midway the list is still whole: the looked-up place is DONE, the other still PENDING.
+        middle = reports[1]["extraction"]["candidates"]
+        self.assertEqual(["DONE", "PENDING"], [item["mapSearchStatus"] for item in middle])
+        self.assertNotIn("previewImage", middle[0])
+
+        final = extraction["candidates"]
+        self.assertEqual(["DONE", "DONE"], [item["mapSearchStatus"] for item in final])
+        self.assertTrue(all("previewImage" not in item for item in final))
+
+    def test_evidence_frame_prefers_the_one_that_shows_the_place(self):
+        candidate = {
+            "evidence": [
+                {"source": "audio", "quote": "x", "frame_index": None, "supports_identity": True},
+                {"source": "frame", "quote": "street", "frame_index": 2, "supports_identity": False},
+                {"source": "frame", "quote": "sign", "frame_index": 4, "supports_identity": True},
+                {"source": "frame", "quote": "late", "frame_index": 9, "supports_identity": True},
+            ]
+        }
+        self.assertEqual(4, extractor._candidate_evidence_frame_index(candidate, frame_count=5))
+        self.assertEqual(2, extractor._candidate_evidence_frame_index(candidate, frame_count=3))
+        self.assertIsNone(extractor._candidate_evidence_frame_index({"evidence": []}, frame_count=5))
+
+    def test_places_sharing_a_frame_share_one_rendered_picture(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            frame = Path(temp_dir) / "frame_01.jpg"
+            frame.write_bytes(b"frame")
+            rendered = Path(temp_dir) / "out.jpg"
+            rendered.write_bytes(b"x" * 2048)
+            candidates = [
+                {"candidateRef": ref, "evidence": [
+                    {"source": "frame", "quote": "q", "frame_index": 1, "supports_identity": True}
+                ]}
+                for ref in ("a", "b")
+            ] + [{"candidateRef": "c", "evidence": []}]
+            with patch.object(extractor, "_render_candidate_image", return_value=rendered) as render:
+                images = extractor.build_candidate_preview_images(
+                    candidates, [frame], out_dir=Path(temp_dir)
+                )
+
+        self.assertEqual(1, render.call_count)
+        self.assertEqual({"a", "b"}, set(images))
+        self.assertEqual("image/jpeg", images["a"]["contentType"])
+
+
+
+class SocialPipelinePerformanceTest(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(extractor, "_preferred_ytdlp_profile", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _session(out_dir, info, fail=False):
+        ydl = MagicMock()
+        ydl.__enter__.return_value = ydl
+        if fail:
+            ydl.extract_info.side_effect = AssertionError()
+            return ydl
+        ydl.extract_info.return_value = info
+
+        def download(raw, download):
+            (out_dir / "media.mp4").write_bytes(b"video")
+            return {**raw, "width": 720, "height": 1280}
+
+        ydl.process_ie_result.side_effect = download
+        return ydl
+
+    def test_download_reuses_the_metadata_session_and_prefers_720p(self):
+        info = {"extractor_key": "TikTok", "title": "Trip", "duration": 60}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            ydl = self._session(out_dir, info)
+            with patch.object(extractor, "_yt_dlp_attempts", return_value=[("default", {})]), patch.object(
+                extractor.yt_dlp, "YoutubeDL", return_value=ydl
+            ) as session_factory:
+                _info, profile, media_path = extractor.fetch_video(
+                    "https://www.tiktok.com/@u/video/1", out_dir, 180, {}
+                )
+
+        self.assertEqual(1, session_factory.call_count)
+        self.assertEqual(["res:720"], session_factory.call_args.args[0]["format_sort"])
+        ydl.extract_info.assert_called_once_with(ANY, download=False, process=False)
+        ydl.process_ie_result.assert_called_once()
+        self.assertEqual("default", profile)
+        self.assertEqual("media.mp4", media_path.name)
+
+    def test_over_long_video_is_never_downloaded(self):
+        info = {"extractor_key": "TikTok", "title": "Long", "duration": 400}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ydl = self._session(Path(temp_dir), info)
+            with patch.object(extractor, "_yt_dlp_attempts", return_value=[("default", {})]), patch.object(
+                extractor.yt_dlp, "YoutubeDL", return_value=ydl
+            ):
+                _info, _profile, media_path = extractor.fetch_video(
+                    "https://www.tiktok.com/@u/video/1", Path(temp_dir), 180, {}
+                )
+
+        self.assertIsNone(media_path)
+        ydl.process_ie_result.assert_not_called()
+
+    def test_profile_that_worked_is_tried_first_next_time(self):
+        info = {"extractor_key": "TikTok", "title": "Trip", "duration": 60}
+        attempts = [("impersonate", {"impersonate": "chrome"}), ("default", {})]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            out_dir = Path(temp_dir)
+            sessions = []
+
+            def open_session(opts):
+                session = self._session(out_dir, info, fail="impersonate" in opts)
+                sessions.append("impersonate" if "impersonate" in opts else "default")
+                return session
+
+            with patch.object(extractor, "_yt_dlp_attempts", side_effect=lambda: list(attempts)), patch.object(
+                extractor.yt_dlp, "YoutubeDL", side_effect=open_session
+            ):
+                extractor.fetch_video("https://www.tiktok.com/@u/video/1", out_dir, 180, {})
+                extractor.fetch_video("https://www.tiktok.com/@u/video/2", out_dir, 180, {})
+
+        self.assertEqual(["impersonate", "default", "default"], sessions)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_single_pass_cuts_the_same_frames_as_seeking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "source.mp4"
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=12",
+                 "-c:v", "libx264", "-preset", "ultrafast", str(source)],
+                check=True,
+            )
+            with self.assertLogs(extractor.LOG, level="INFO") as logs:
+                frames = extractor.extract_frames(source, Path(temp_dir), 50, 3, 160, 10, 12)
+
+            self.assertEqual(4, len(frames))  # 1s, 4s, 7s, 10s
+            self.assertTrue(all(frame.stat().st_size > 0 for frame in frames))
+        self.assertTrue(any("method=single-pass" in line for line in logs.output))
+
+    def test_frames_fall_back_to_seeking_when_single_pass_yields_nothing(self):
+        def fake_ffmpeg(command, timeout):
+            Path(command[-1]).write_bytes(b"jpeg")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            extractor, "_extract_frames_single_pass", return_value=[]
+        ), patch.object(extractor, "_run", side_effect=fake_ffmpeg) as run:
+            frames = extractor.extract_frames(Path("media.mp4"), Path(temp_dir), 50, 3, 160, 10, 12)
+
+        self.assertEqual(4, len(frames))
+        self.assertEqual(4, run.call_count)
+
+    def test_audio_is_compressed_before_transcription(self):
+        with patch.object(extractor, "has_audio_stream", return_value=True), patch.object(
+            extractor, "_run"
+        ) as run:
+            extractor.extract_audio(Path("media.mp4"), Path("."), 60)
+
+        command = run.call_args.args[0]
+        self.assertIn("libmp3lame", command)
+        self.assertTrue(command[-1].endswith("audio.mp3"))
+
+    def test_local_whisper_uses_greedy_decoding_and_bounded_threads(self):
+        model = MagicMock()
+        model.transcribe.return_value = ([], MagicMock(language="vi", language_probability=1.0))
+        with patch.object(extractor, "_LOCAL_WHISPER", None), patch(
+            "faster_whisper.WhisperModel", return_value=model
+        ) as whisper_class:
+            extractor.transcribe_audio_local(Path("audio.mp3"))
+
+        self.assertEqual(2, whisper_class.call_args.kwargs["cpu_threads"])
+        self.assertEqual(1, model.transcribe.call_args.kwargs["beam_size"])
 
 if __name__ == "__main__":
     unittest.main()

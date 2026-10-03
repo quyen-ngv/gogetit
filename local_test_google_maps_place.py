@@ -20,7 +20,7 @@ from upload_to_api import format_place_for_api
 
 
 AUDIT_FIELDS = (
-    "placeId", "cid", "dataId", "title", "category", "placeGroup",
+    "placeId", "cid", "dataId", "title", "translations", "category", "placeGroup",
     "address", "latitude", "longitude", "plusCode", "timezone", "phone",
     "website", "googleMapsLink", "reviewCount", "reviewRating",
     "reviewsPerRating", "thumbnail", "images", "descriptions", "status",

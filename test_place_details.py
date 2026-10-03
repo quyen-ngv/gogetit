@@ -2,6 +2,8 @@ import json
 import unittest
 
 from run_job import (
+    build_title_translations,
+    preview_place_media,
     extract_data_id,
     normalize_place_information,
     normalize_about_option,
@@ -143,6 +145,51 @@ class PlaceDetailParserTest(unittest.TestCase):
         )
         self.assertTrue(json.loads(body["reservations"])["available"])
         self.assertTrue(json.loads(body["orderOnline"])["available"])
+
+
+class PreviewPayloadTest(unittest.TestCase):
+    HERO = "https://lh3.googleusercontent.com/grass-cs/HERO=w130-h86-k-no"
+    PACK = "https://lh3.googleusercontent.com/grass-cs/PACK=w180-h120-k-no"
+    AVATAR = "https://lh3.googleusercontent.com/a/USER=s120-c-rp"
+
+    def _place(self):
+        place = [None] * 180
+        place[11] = "Hoàn Kiếm Lake"
+        place[37] = [[[None] * 6 + [[self.PACK]]]]
+        place[72] = [[[None] * 6 + [[self.HERO, "", [750, 494]]], [None] * 6 + [[self.HERO]]]]
+        place[101] = "Hồ Hoàn Kiếm"
+        place[51] = [["https://lh3.googleusercontent.com/grass-cs/VIDEO=m18", "https://lh3.googleusercontent.com/grass-cs/VIDEO=mm,dash"]]
+        place[175] = [[self.AVATAR, [self.PACK.replace("=w180", "=w400")]]]
+        return place
+
+    def test_hero_photos_and_native_name_come_from_preview(self):
+        media = preview_place_media(self._place())
+        self.assertEqual(media["hero"], self.HERO)
+        # Deduplicated by base URL, avatars excluded, payload order kept.
+        self.assertEqual(media["photos"], [self.PACK, self.HERO])
+        self.assertEqual(media["localTitle"], "Hồ Hoàn Kiếm")
+
+    def test_missing_or_short_payload_is_empty_not_an_error(self):
+        self.assertEqual(preview_place_media(None), {"hero": "", "photos": [], "localTitle": ""})
+        self.assertEqual(preview_place_media([None] * 10)["hero"], "")
+
+    def test_native_name_becomes_vi_only_for_places_in_vietnam(self):
+        self.assertEqual(
+            build_title_translations("Hoàn Kiếm Lake", "Hồ Hoàn Kiếm", in_vietnam=True),
+            {"vi": {"name": "Hồ Hoàn Kiếm"}, "en": {"name": "Hoàn Kiếm Lake"}},
+        )
+        self.assertIsNone(build_title_translations("Eiffel Tower", "Tour Eiffel", in_vietnam=False))
+        self.assertIsNone(build_title_translations("Phở Thìn", "", in_vietnam=True))
+        self.assertIsNone(build_title_translations("Phở Thìn", "phở thìn", in_vietnam=True))
+
+    def test_uploader_forwards_title_translations(self):
+        body = format_place_for_api({
+            "title": "Hoàn Kiếm Lake",
+            "translations": {"vi": {"name": "Hồ Hoàn Kiếm"}, "en": {"name": "Hoàn Kiếm Lake"}},
+        })
+        self.assertEqual(body["title"], "Hoàn Kiếm Lake")
+        self.assertEqual(body["translations"]["vi"]["name"], "Hồ Hoàn Kiếm")
+        self.assertNotIn("translations", format_place_for_api({"title": "Phở Thìn", "translations": None}))
 
 
 if __name__ == "__main__":

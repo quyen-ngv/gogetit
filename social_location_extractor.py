@@ -11,7 +11,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable
@@ -22,6 +26,7 @@ import requests
 import yt_dlp
 from anthropic import Anthropic
 
+import ai_call_log
 from browser_runtime import acquire_browser_slot, release_browser_slot
 from config import (
     AI_BASE_URL,
@@ -35,8 +40,10 @@ from config import (
     DEEPSEEK_BASE_URL,
     GROQ_API_KEY,
     GROQ_WHISPER_MODEL,
+    LOCAL_WHISPER_BEAM_SIZE,
     LOCAL_WHISPER_CACHE_DIR,
     LOCAL_WHISPER_COMPUTE_TYPE,
+    LOCAL_WHISPER_CPU_THREADS,
     LOCAL_WHISPER_DEVICE,
     LOCAL_WHISPER_ENABLED,
     LOCAL_WHISPER_LANGUAGE,
@@ -44,6 +51,7 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_CHAT_MODEL,
     OPENAI_WHISPER_MODEL,
+    SOCIAL_AI_REASONING_EFFORT,
     SOCIAL_YTDLP_COOKIE_FILE,
     SOCIAL_YTDLP_IMPERSONATE,
 )
@@ -52,6 +60,7 @@ from place_searcher import search_google_maps
 
 LOG = logging.getLogger("social_location_extractor")
 _LOCAL_WHISPER = None
+_LOCAL_WHISPER_LOCK = threading.Lock()
 
 AI_GUARDRAIL_MIN_CONFIDENCE = 0.72
 MAP_MIN_MATCH_SCORE = 0.68
@@ -96,6 +105,15 @@ def is_social_video_url(url: str) -> bool:
 def _run(command: list[str], *, timeout: int) -> None:
     LOG.debug("Running command: %s", " ".join(command[:4] + ["..."] if len(command) > 4 else command))
     subprocess.run(command, check=True, timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+@contextmanager
+def _timed(timings: dict[str, float], step: str):
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[step] = round(timings.get(step, 0.0) + time.monotonic() - started, 1)
 
 
 def _first_text(value: Any) -> str:
@@ -342,6 +360,101 @@ def download_media(
     raise RuntimeError(f"SOCIAL_VIDEO_DOWNLOAD_BLOCKED: TikTok/Instagram download failed: {detail}")
 
 
+# Frames go to the AI at <=448px and candidate pictures are cut at <=720px, so a source whose
+# short side is 720px loses nothing; "res" is the smallest dimension, so this also holds for
+# vertical video. It downloads and decodes several times faster than the 1080p+ original.
+_VIDEO_FORMAT_SORT = ("res:720",)
+# The yt-dlp profile that last worked. The impersonate profile can fail on every request
+# for weeks; trying the working one first saves a failed TikTok round trip per job.
+_preferred_ytdlp_profile: str | None = None
+
+
+def _downloaded_media(out_dir: Path) -> Path | None:
+    files = [
+        path for path in out_dir.glob("media.*")
+        if path.suffix not in {".part", ".ytdl"} and path.stat().st_size > 0
+    ]
+    return max(files, key=lambda path: path.stat().st_mtime) if files else None
+
+
+def fetch_video(
+    url: str,
+    out_dir: Path,
+    max_duration_seconds: int,
+    timings: dict[str, float],
+) -> tuple[dict[str, Any], str, Path | None]:
+    """Read metadata and download the media in one yt-dlp session.
+
+    The download reuses the formats and cookies the metadata request obtained, instead of
+    asking TikTok for the page a second time. Returns ``media_path=None`` when the reported
+    duration is over the limit, so an over-long video is never downloaded.
+    """
+    global _preferred_ytdlp_profile
+    LOG.info("Fetching social video: url=%s", url)
+    attempts = _yt_dlp_attempts()
+    if _preferred_ytdlp_profile:
+        attempts.sort(key=lambda item: item[0] != _preferred_ytdlp_profile)
+    last_error: Exception | None = None
+    for profile, base_options in attempts:
+        opts = {
+            **base_options,
+            "outtmpl": str(out_dir / "media.%(ext)s"),
+            "format": "bv*+ba/b",
+            "format_sort": list(_VIDEO_FORMAT_SORT),
+            "merge_output_format": "mp4",
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                with _timed(timings, "metadata"):
+                    info = ydl.extract_info(url, download=False, process=False)
+                duration = _positive_float(info.get("duration"))
+                LOG.info(
+                    "Metadata extracted: profile=%s platform=%s duration=%s title=%r",
+                    profile,
+                    info.get("extractor_key") or info.get("extractor") or "",
+                    duration,
+                    _first_text(info.get("title"))[:120],
+                )
+                if duration is not None and duration > max_duration_seconds:
+                    _preferred_ytdlp_profile = profile
+                    return info, profile, None
+                with _timed(timings, "download"):
+                    info = ydl.process_ie_result(info, download=True)
+            media_path = _downloaded_media(out_dir)
+            if media_path is None:
+                raise RuntimeError("yt-dlp finished without a media file")
+            _preferred_ytdlp_profile = profile
+            LOG.info(
+                "Media downloaded: profile=%s path=%s size=%s height=%s width=%s",
+                profile,
+                media_path.name,
+                media_path.stat().st_size,
+                info.get("height"),
+                info.get("width"),
+            )
+            return info, profile, media_path
+        except Exception as exc:
+            last_error = exc
+            LOG.warning("Social fetch attempt failed: profile=%s error=%s", profile, _exception_summary(exc)[:500])
+
+    if "tiktok.com" in url.lower():
+        try:
+            with _timed(timings, "metadata"):
+                info = _extract_tiktok_embed(url)
+            duration = _positive_float(info.get("duration"))
+            if duration is not None and duration > max_duration_seconds:
+                return info, "tiktok-embed", None
+            with _timed(timings, "download"):
+                media_path = _download_tiktok_embed_media(str(info.get("_embed_media_url") or ""), out_dir)
+            return info, "tiktok-embed", media_path
+        except Exception as exc:
+            last_error = exc
+            LOG.warning("TikTok player fallback failed: error=%s", _exception_summary(exc)[:500])
+
+    detail = _exception_summary(last_error) if last_error else "unknown download error"
+    raise RuntimeError(f"SOCIAL_VIDEO_DOWNLOAD_BLOCKED: TikTok/Instagram download failed: {detail}")
+
+
 def probe_media_duration(media_path: Path) -> float | None:
     try:
         result = subprocess.run(
@@ -385,7 +498,9 @@ def extract_audio(media_path: Path, out_dir: Path, max_seconds: int | None) -> P
     if not has_audio_stream(media_path):
         LOG.info("Skipping audio extraction; media has no audio stream: media=%s", media_path.name)
         return None
-    audio_path = out_dir / "audio.wav"
+    # 32 kbps mono MP3 is ~6x smaller than 16 kHz PCM WAV for the same speech, so the upload
+    # to a hosted transcriber is that much shorter; local Whisper decodes it just as well.
+    audio_path = out_dir / "audio.mp3"
     try:
         command = [
             "ffmpeg",
@@ -403,6 +518,10 @@ def extract_audio(media_path: Path, out_dir: Path, max_seconds: int | None) -> P
             "16000",
             "-ac",
             "1",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "32k",
             str(audio_path),
         ])
         
@@ -449,6 +568,18 @@ def extract_frames(
     frame_dir = out_dir / "frames"
     frame_dir.mkdir(parents=True, exist_ok=True)
 
+    frames = _extract_frames_single_pass(
+        media_path,
+        frame_dir,
+        timestamps,
+        interval,
+        image_max_width,
+        image_jpeg_quality,
+    )
+    if frames:
+        LOG.info("Frames extracted: count=%s method=single-pass", len(frames))
+        return frames
+
     for index, timestamp in enumerate(timestamps, start=1):
         frame_path = frame_dir / f"frame_{index:02d}.jpg"
         try:
@@ -474,16 +605,67 @@ def extract_frames(
             LOG.debug("Frame extraction failed at %.3fs", timestamp, exc_info=True)
 
     frames = sorted(frame_dir.glob("frame_*.jpg"))[:max_frames]
-    LOG.info("Frames extracted: count=%s", len(frames))
+    LOG.info("Frames extracted: count=%s method=per-frame", len(frames))
     return frames
 
 
-_FRAME_DEDUP_HAMMING_THRESHOLD = 6  # of 64 bits; near-identical frames rarely exceed this
+def _extract_frames_single_pass(
+    media_path: Path,
+    frame_dir: Path,
+    timestamps: list[float],
+    interval: float,
+    image_max_width: int,
+    image_jpeg_quality: int,
+) -> list[Path]:
+    """The same frames as one ffmpeg call per timestamp, from a single decode of the video.
+
+    Frame N is the first frame at or after ``timestamps[N-1]``, exactly what a seek per
+    timestamp returns, so frame indexes still map to ``_frame_timestamps`` for the candidate
+    pictures. Returns [] when the grid does not apply or ffmpeg fails; the caller then falls
+    back to seeking frame by frame.
+    """
+    if len(timestamps) < 2 or interval <= 0 or timestamps[0] != 1.0:
+        return []
+    # Selects the first frame of each [1 + k*interval, 1 + (k+1)*interval) bucket.
+    select = f"gte(t,1)*lt(floor((prev_t-1)/{interval:g}),floor((t-1)/{interval:g}))"
+    try:
+        _run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(media_path),
+                "-an",
+                "-vf",
+                f"select='{select}',scale='min({image_max_width},iw)':-2",
+                "-fps_mode",
+                "passthrough",
+                "-frames:v",
+                str(len(timestamps)),
+                "-q:v",
+                str(image_jpeg_quality),
+                str(frame_dir / "frame_%02d.jpg"),
+            ],
+            timeout=300,
+        )
+    except Exception:
+        LOG.warning("Single-pass frame extraction failed; seeking frame by frame", exc_info=True)
+        for path in frame_dir.glob("frame_*.jpg"):
+            path.unlink(missing_ok=True)
+        return []
+    return sorted(frame_dir.glob("frame_*.jpg"))
 
 
-def _average_hash(path: Path, hash_size: int = 8) -> int | None:
-    """8x8 grayscale average hash (aHash). Cheap and deliberately coarse --
-    it only needs to catch "basically the same frame", not fine detail."""
+# Frames are compared as 48px-wide grayscale thumbnails cut into 6x6 tiles. A frame is a
+# duplicate only when no tile changed by more than this much (0-255): the same picture with
+# the same text. A whole-image hash cannot see a title such as "3. Cây cô đơn" appearing over
+# an unchanged background, and dropping that frame lost the place.
+_FRAME_DEDUP_THUMBNAIL_WIDTH = 48
+_FRAME_DEDUP_TILE = 6
+_FRAME_DEDUP_MAX_TILE_DIFF = 20
+
+
+def _frame_thumbnail(path: Path):
     try:
         from PIL import Image
     except ImportError:
@@ -491,43 +673,56 @@ def _average_hash(path: Path, hash_size: int = 8) -> int | None:
         return None
     try:
         with Image.open(path) as img:
-            pixels = list(img.convert("L").resize((hash_size, hash_size), Image.LANCZOS).getdata())
+            gray = img.convert("L")
+            height = max(_FRAME_DEDUP_TILE, round(gray.height * _FRAME_DEDUP_THUMBNAIL_WIDTH / gray.width))
+            return gray.resize((_FRAME_DEDUP_THUMBNAIL_WIDTH, height), Image.BILINEAR)
     except Exception:
-        LOG.debug("Frame hash failed for %s", path.name, exc_info=True)
+        LOG.debug("Frame thumbnail failed for %s", path.name, exc_info=True)
         return None
-    average = sum(pixels) / len(pixels)
-    bits = 0
-    for pixel in pixels:
-        bits = (bits << 1) | (1 if pixel >= average else 0)
-    return bits
+
+
+def _largest_tile_difference(first, second) -> float:
+    if first.size != second.size:
+        return 255.0
+    from PIL import ImageChops
+
+    width, height = first.size
+    tile = _FRAME_DEDUP_TILE
+    pixels = ImageChops.difference(first, second).tobytes()
+    largest = 0.0
+    for top in range(0, height - tile + 1, tile):
+        for left in range(0, width - tile + 1, tile):
+            total = sum(
+                sum(pixels[row * width + left:row * width + left + tile])
+                for row in range(top, top + tile)
+            )
+            largest = max(largest, total / (tile * tile))
+    return largest
 
 
 def dedupe_near_identical_frames(frames: list[Path]) -> list[Path]:
-    """Drop frames that are visually near-identical to the most recently kept
-    frame, comparing consecutive frames only (O(n), preserves order).
+    """Drop frames that are visually identical to the most recently kept frame, comparing
+    consecutive frames only (O(n), preserves order).
 
-    A static or talking-head stretch of video samples several frames that
-    carry no extra evidence over the one before it, yet each costs the same
-    image tokens in the extraction call as a frame showing a new scene or a
-    storefront sign. If Pillow is unavailable or a frame fails to decode,
-    that frame is kept as-is -- this only ever removes frames, never risks
-    dropping evidence the caller can't otherwise recover.
+    A static stretch of video samples several frames that carry no extra evidence over the
+    one before it, yet each costs the same image tokens in the extraction call. Any local
+    change -- a title, a subtitle line, a sign coming into view -- keeps the frame. If Pillow
+    is unavailable or a frame fails to decode, that frame is kept as-is.
     """
     if len(frames) <= 2:
         return frames
     kept = [frames[0]]
-    kept_hash = _average_hash(frames[0])
+    kept_thumbnail = _frame_thumbnail(frames[0])
     for frame in frames[1:]:
-        frame_hash = _average_hash(frame)
-        if kept_hash is None or frame_hash is None:
-            kept.append(frame)
-            kept_hash = frame_hash
-            continue
-        distance = bin(kept_hash ^ frame_hash).count("1")
-        if distance <= _FRAME_DEDUP_HAMMING_THRESHOLD:
+        thumbnail = _frame_thumbnail(frame)
+        if (
+            kept_thumbnail is not None
+            and thumbnail is not None
+            and _largest_tile_difference(kept_thumbnail, thumbnail) <= _FRAME_DEDUP_MAX_TILE_DIFF
+        ):
             continue
         kept.append(frame)
-        kept_hash = frame_hash
+        kept_thumbnail = thumbnail
     return kept
 
 
@@ -876,17 +1071,67 @@ def download_metadata_images(
     return files
 
 
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def _record_chat(operation: str, provider: str, model: str, request_payload: dict[str, Any],
+                 response: requests.Response, started: float) -> None:
+    """Log one chat/completions call (prompt, response, usage) to the backend's AI call log."""
+    body = None
+    try:
+        body = response.json()
+    except Exception:
+        pass
+    input_tokens, cached_tokens, output_tokens = ai_call_log.chat_usage(body)
+    ai_call_log.record(
+        operation=operation, provider=provider, model=model, ok=response.ok, request=request_payload,
+        response=body if response.ok else None,
+        error=None if response.ok else {"httpStatus": response.status_code, "body": response.text[:2000]},
+        input_tokens=input_tokens, cached_input_tokens=cached_tokens, output_tokens=output_tokens,
+        latency_ms=_elapsed_ms(started),
+    )
+
+
+def _record_anthropic(operation: str, model: str, request_payload: dict[str, Any], message: Any,
+                      started: float) -> None:
+    input_tokens, cached_tokens, output_tokens = ai_call_log.anthropic_usage(message)
+    ai_call_log.record(
+        operation=operation, provider="anthropic", model=model, ok=True, request=request_payload,
+        response=message, input_tokens=input_tokens, cached_input_tokens=cached_tokens,
+        output_tokens=output_tokens, latency_ms=_elapsed_ms(started),
+    )
+
+
+def _record_transcription(response: requests.Response, provider: str, model: str, audio_path: Path,
+                          started: float) -> None:
+    body = None
+    try:
+        body = response.json() if response.ok else None
+    except Exception:
+        pass
+    ai_call_log.record(
+        operation="TRANSCRIBE_AUDIO", provider=provider, model=model, ok=response.ok,
+        request={"model": model, "file": audio_path.name, "bytes": audio_path.stat().st_size},
+        response=body,
+        error=None if response.ok else {"httpStatus": response.status_code, "body": response.text[:2000]},
+        latency_ms=_elapsed_ms(started),
+    )
+
+
 def transcribe_audio(audio_path: Path) -> tuple[str, str]:
     if GROQ_API_KEY:
         LOG.info("Transcribing audio with Groq: model=%s", GROQ_WHISPER_MODEL)
+        started = time.monotonic()
         with audio_path.open("rb") as file:
             response = requests.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
                 data={"model": GROQ_WHISPER_MODEL},
-                files={"file": (audio_path.name, file, "audio/wav")},
+                files={"file": (audio_path.name, file, "audio/mpeg")},
                 timeout=120,
             )
+        _record_transcription(response, "groq", GROQ_WHISPER_MODEL, audio_path, started)
         response.raise_for_status()
         text = response.json().get("text", "").strip()
         LOG.info("Groq transcript complete: chars=%s", len(text))
@@ -894,14 +1139,16 @@ def transcribe_audio(audio_path: Path) -> tuple[str, str]:
 
     if OPENAI_API_KEY:
         LOG.info("Transcribing audio with OpenAI: model=%s", OPENAI_WHISPER_MODEL)
+        started = time.monotonic()
         with audio_path.open("rb") as file:
             response = requests.post(
                 "https://api.openai.com/v1/audio/transcriptions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
                 data={"model": OPENAI_WHISPER_MODEL},
-                files={"file": (audio_path.name, file, "audio/wav")},
+                files={"file": (audio_path.name, file, "audio/mpeg")},
                 timeout=120,
             )
+        _record_transcription(response, "openai", OPENAI_WHISPER_MODEL, audio_path, started)
         response.raise_for_status()
         text = response.json().get("text", "").strip()
         LOG.info("OpenAI transcript complete: chars=%s", len(text))
@@ -914,7 +1161,23 @@ def transcribe_audio(audio_path: Path) -> tuple[str, str]:
     return "", "skipped:no_transcriber"
 
 
+def warm_up_local_transcriber() -> None:
+    """Load local Whisper at startup when it is the transcriber jobs will use, so the first
+    social video job does not wait for the model to load."""
+    if GROQ_API_KEY or OPENAI_API_KEY or not LOCAL_WHISPER_ENABLED:
+        return
+    try:
+        _get_local_whisper_model()
+    except Exception:
+        LOG.warning("Local Whisper warm-up failed; the first job will retry the load", exc_info=True)
+
+
 def _get_local_whisper_model():
+    with _LOCAL_WHISPER_LOCK:
+        return _load_local_whisper_model()
+
+
+def _load_local_whisper_model():
     global _LOCAL_WHISPER
     if _LOCAL_WHISPER is not None:
         return _LOCAL_WHISPER
@@ -931,6 +1194,7 @@ def _get_local_whisper_model():
     kwargs: dict[str, Any] = {
         "device": LOCAL_WHISPER_DEVICE,
         "compute_type": LOCAL_WHISPER_COMPUTE_TYPE,
+        "cpu_threads": LOCAL_WHISPER_CPU_THREADS,
     }
     if LOCAL_WHISPER_CACHE_DIR:
         kwargs["download_root"] = LOCAL_WHISPER_CACHE_DIR
@@ -944,7 +1208,7 @@ def transcribe_audio_local(audio_path: Path) -> tuple[str, str]:
     try:
         model = _get_local_whisper_model()
         LOG.info("Transcribing audio with local faster-whisper: language=%s", LOCAL_WHISPER_LANGUAGE or "auto")
-        kwargs: dict[str, Any] = {"vad_filter": True}
+        kwargs: dict[str, Any] = {"vad_filter": True, "beam_size": LOCAL_WHISPER_BEAM_SIZE}
         if LOCAL_WHISPER_LANGUAGE:
             kwargs["language"] = LOCAL_WHISPER_LANGUAGE
         segments, info = model.transcribe(str(audio_path), **kwargs)
@@ -1024,13 +1288,15 @@ def _claude_extraction_tool_schema() -> dict[str, Any]:
         "input_schema": {
             "type": "object",
             "additionalProperties": True,
-            "required": ["is_relevant", "relevance_reason", "found", "needs_confirmation", "summary", "useful_summary", "general_guidance", "discarded_mentions", "contentType", "destination", "durationDays", "candidates"],
+            "required": ["is_relevant", "relevance_reason", "found", "needs_confirmation", "summary", "trip_title", "trip_description", "useful_summary", "general_guidance", "discarded_mentions", "contentType", "destination", "durationDays", "candidates"],
             "properties": {
                 "is_relevant": {"type": "boolean"},
                 "relevance_reason": {"type": "string"},
                 "found": {"type": "boolean"},
                 "needs_confirmation": {"type": "boolean"},
                 "summary": {"type": "string"},
+                "trip_title": {"type": "string"},
+                "trip_description": {"type": "string"},
                 "useful_summary": {"type": "string"},
                 "general_guidance": {"type": "array", "items": {"type": "string"}},
                 "contentType": {"type": "string", "enum": ["ITINERARY", "PLACE_LIST"]},
@@ -1407,6 +1673,8 @@ def _normalize_extraction_payload(parsed: dict[str, Any]) -> dict[str, Any]:
         duration_confidence = None
     parsed["durationConfidence"] = min(max(duration_confidence, 0.0), 1.0) if duration_confidence is not None else None
     parsed["summary"] = str(parsed.get("summary") or "").strip()
+    parsed["trip_title"] = str(parsed.get("trip_title") or "").strip()[:120] or None
+    parsed["trip_description"] = str(parsed.get("trip_description") or "").strip() or None
     parsed["useful_summary"] = str(parsed.get("useful_summary") or "").strip()
     parsed["general_guidance"] = _string_list(parsed.get("general_guidance"))
     parsed["discarded_mentions"] = [
@@ -1632,6 +1900,49 @@ def _resolve_ai_credentials(
     return provider, model, base_url, api_key
 
 
+_OPENAI_REASONING_MODEL = re.compile(r"^(o\d|gpt-([5-9]|\d{2,})(?!-chat))", re.IGNORECASE)
+# gpt-5.1 and later (gpt-6-luna included) accept reasoning_effort="none", which
+# turns reasoning off; gpt-5/gpt-5-mini and the o-series do not.
+_OPENAI_SUPPORTS_NO_REASONING = re.compile(r"^gpt-(5\.\d|[6-9]|\d{2,})", re.IGNORECASE)
+# max_completion_tokens covers hidden reasoning AND the answer. A budget sized
+# for the answer alone comes back as empty content with finish_reason=length.
+_REASONING_EXTRACTION_MAX_TOKENS = 32000
+_REASONING_PREFILTER_MAX_TOKENS = 2000
+
+
+def _is_openai_reasoning_model(model: str) -> bool:
+    """OpenAI reasoning models reject any temperature but the default and spend
+    max_completion_tokens on reasoning before writing the answer."""
+    return bool(_OPENAI_REASONING_MODEL.match(model.strip()))
+
+
+def _openai_reasoning_effort(model: str, *, thorough: bool = False) -> str:
+    """`thorough` is the place extraction: a little reasoning makes the model walk the whole
+    video and enumerate every stop. The topic pre-filter only needs a quick yes/no."""
+    if SOCIAL_AI_REASONING_EFFORT:
+        return SOCIAL_AI_REASONING_EFFORT
+    if thorough:
+        return "low"
+    return "none" if _OPENAI_SUPPORTS_NO_REASONING.match(model.strip()) else "low"
+
+
+def _chat_completion_content(provider: str, response_payload: dict[str, Any]) -> str:
+    try:
+        choice = response_payload["choices"][0]
+        output = choice["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError(f"{provider} returned an unexpected response payload") from exc
+    if not (output or "").strip():
+        usage = response_payload.get("usage") or {}
+        details = usage.get("completion_tokens_details") or {}
+        raise ValueError(
+            f"{provider} returned empty content: finish_reason={choice.get('finish_reason')} "
+            f"completion_tokens={usage.get('completion_tokens')} "
+            f"reasoning_tokens={details.get('reasoning_tokens')}"
+        )
+    return output
+
+
 _PREFILTER_MAX_TRANSCRIPT_CHARS = 4000
 
 
@@ -1687,12 +1998,17 @@ Return only this JSON object, no markdown, no commentary:
             client_kwargs: dict[str, Any] = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
+            started = time.monotonic()
             message = Anthropic(**client_kwargs).messages.create(
                 model=model,
                 max_tokens=120,
                 temperature=0,
                 messages=[{"role": "user", "content": prompt}],
             )
+            _record_anthropic("PREFILTER_TOPIC", model, {
+                "model": model, "max_tokens": 120, "temperature": 0,
+                "messages": [{"role": "user", "content": prompt}],
+            }, message, started)
             output = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
             parsed = _extract_json(output)
             usage = getattr(message, "usage", None)
@@ -1703,24 +2019,29 @@ Return only this JSON object, no markdown, no commentary:
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
-                "temperature": 0,
             }
-            if provider == "OPENAI":
+            if provider == "OPENAI" and _is_openai_reasoning_model(model):
+                request_payload["reasoning_effort"] = _openai_reasoning_effort(model)
+                request_payload["max_completion_tokens"] = _REASONING_PREFILTER_MAX_TOKENS
+            elif provider == "OPENAI":
+                request_payload["temperature"] = 0
                 request_payload["max_completion_tokens"] = 120
             else:
+                request_payload["temperature"] = 0
                 request_payload["max_tokens"] = 120
+            started = time.monotonic()
             response = requests.post(
                 f"{base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
                 json=request_payload,
                 timeout=min(30, AI_REQUEST_TIMEOUT_SECONDS),
             )
+            _record_chat("PREFILTER_TOPIC", provider, model, request_payload, response, started)
             if not response.ok:
                 LOG.warning("Topic pre-filter HTTP %s: %s", response.status_code, response.text[:300])
                 return None
             response_payload = response.json()
-            output = response_payload["choices"][0]["message"]["content"]
-            parsed = _extract_json(output or "")
+            parsed = _extract_json(_chat_completion_content(provider, response_payload))
             usage = response_payload.get("usage") or {}
             input_tokens = usage.get("prompt_tokens")
             output_tokens = usage.get("completion_tokens")
@@ -1777,7 +2098,8 @@ def extract_candidates_with_ai(
         "response_language": language,
     }
     
-    max_tokens = 8000
+    # Room for many places, each with its description, tips and evidence.
+    max_tokens = 16000
     
     system_prompt = f"""
 You are a meticulous social-video place extraction engine for a travel application.
@@ -1787,7 +2109,7 @@ Reason silently in two passes: first inventory every possible place mention, the
 Return every distinct named place or concrete visit point that the video presents as a useful travel spot. Keep uncertain identity in the candidate with an explicit unresolved verification state; do not silently discard a named mention because Maps cannot resolve it.
 Allow normal transcription errors, accents, abbreviations, aliases, and natural paraphrases when the combined evidence still establishes the identity.
 Never turn an unnamed activity, venue category, route instruction, or nearby landmark into a guessed business or POI. A named transport leg or named area may remain an activity when it is not a resolvable place.
-For every candidate, recap what this specific video says or shows about that place; do not replace the recap with a generic encyclopedia description.
+For every candidate, write what a traveller needs to know about that place, drawn only from what this video says or shows; never pad it with generic encyclopedia text.
 Each candidate query must be Google Maps-ready and include the exact name plus the most specific supported branch/address/district/city/region/country context.
 Write user-facing descriptions and guidance in {language}, preserving proper names and quoted evidence in their original language where appropriate.
 """.strip()
@@ -1802,7 +2124,9 @@ Topic gate:
 
 Trust rules:
 - Audio transcript is high-trust evidence but may contain recognition errors, missing accents, or small word substitutions. Judge semantic support, not literal equality alone.
-- Images/frames may establish identity through readable storefront signs, labels, maps, or titles. Distinguish real signage from creator overlays and unrelated UI.
+- Images/frames establish identity through readable storefront signs, labels, maps and on-screen titles. A title the creator puts over the video to name the current stop (often numbered, e.g. "3. Cây cô đơn") is direct identity evidence: use EXACT_VISIBLE_SIGN with that frame index. Ignore only platform UI, usernames, hashtags, watermarks, phone numbers and ads.
+- Subtitle lines burned into the frames are the creator's spoken words, usually spelled correctly. Use them to fix speech-recognition errors.
+- Speech recognition often garbles Vietnamese proper names (e.g. "tà sồa" for "Tà Xùa", "mỏng cá heo" for "Mỏm cá heo", "amê hyu" for "Army Hill"). Write the correct, commonly used name when subtitles, on-screen text, or the well-known landmarks of the destination make it clear. This is correcting a transcription, not inference.
 - Do not let generic scenery, food photos, interiors, or weak visual guesses override a specific audio mention.
 - Do not extract unnamed references such as "quán cafe này", "quán bánh căn", "đi ăn", "đi ngắm biển", or equivalent generic phrases.
 - A route/access/support venue near a named destination is not a separate candidate unless its own exact proper name is directly evidenced.
@@ -1824,9 +2148,17 @@ Trust rules:
 - Besides identifying places, summarize useful trip/food/context information from the video.
 - Put general useful information that is not tied to one specific place in useful_summary/general_guidance.
 - Put place-specific useful information inside that candidate only.
-- Candidate description must be a concise recap of what this video says or shows about that exact place. If the video only names it, say only that; never fill the recap with outside knowledge.
+- Write every user-facing text field (trip_title, trip_description, useful_summary, general_guidance, candidate description, useful_info, visit_guidance) the way a seasoned local planner writes a real trip plan: concrete, practical and warm. Share what to do, see, eat or order there, the best time to go, prices, how to get there, what to bring or avoid, and the first-hand experience and recommendations voiced in the clip.
+- Every fact must come from the audio, visible text, or frames. When the video gives little about a place, write one short, plain sentence instead of padding it with outside knowledge.
+- Never refer to the source in those fields: no "video", "clip", "TikTok", "creator", "theo video", "trong video", "bạn ấy", "người quay", and nothing about following or preserving an order. Write as if you are the planner speaking directly to the traveller.
+- Never copy the caption, title, or hashtags into user-facing fields.
+- trip_title: a short, natural name for the trip (at most 60 characters) built from the destination, length and character of the plan, e.g. "Đà Lạt 3 ngày săn mây và cà phê đồi". Not the video's title.
+- trip_description: 2-4 sentences giving the overall picture of the trip and the most useful practical advice from the video (when to go, how to get around, budget, pace, what to prepare).
+- Candidate description: 2-4 sentences about that stop for someone following the plan: what makes it worth the stop, what to do or order, and any tip, timing or price mentioned. Put extra stand-alone tips in useful_info/visit_guidance, one tip per entry.
 - Do not invent prices, opening hours, transport details, reservation requirements, or tips unless supported by audio, visible text, or reliable context in the input.
 - Inspect the entire transcript and every supplied frame/slide before deciding the candidate list.
+- Completeness check before answering: walk the transcript sentence by sentence and the frames in order. Every named stop, numbered item, viewpoint, eatery, cafe, homestay or named experience must end up either as a candidate or in discarded_mentions with a reason. If the video numbers its stops 1..N, all N must be present.
+- A titled or numbered stop that is an experience rather than a business (e.g. "Milky way" stargazing) is still a candidate, named as the video titles it, with place_type_hint "activity".
 - Extract every distinct, directly evidenced real-world place. Never merge multiple explicitly named list items, branches, restaurants, attractions, or stops into one candidate.
 - Treat listicle language, numbered slides, route stops, and phrases such as "N places" as strong evidence that multiple candidates must be enumerated individually.
 - Preserve the order in which points appear in the video as the highest-priority signal. Use explicit day/time only as additional metadata; do not reorder for popularity or map score.
@@ -1845,7 +2177,9 @@ Return this schema:
   "relevance_reason": string,
   "found": boolean,
   "needs_confirmation": boolean,
-  "summary": string,                 // in {language}
+  "summary": string,                 // in {language}, internal one-line summary of the video
+  "trip_title": string,              // in {language}, <= 60 characters, never the video's title
+  "trip_description": string,        // in {language}, 2-4 sentences of overview and practical advice
   "useful_summary": string,          // in {language}, helpful non-place-specific information from the video
   "general_guidance": [string],      // in {language}, practical tips/instructions not tied to a single place
   "discarded_mentions": [
@@ -1871,7 +2205,7 @@ Return this schema:
       "relation": string|null,
       "name": string,
       "query": string,
-      "description": string,          // in {language}, concise recap of what this video says/shows about this place
+      "description": string,          // in {language}, 2-4 sentences of practical guidance for this stop
       "useful_info": [string],        // in {language}, useful facts/details specifically about this place
       "visit_guidance": [string],     // in {language}, practical guidance specifically for this place
       "city_hint": string|null,
@@ -1913,6 +2247,7 @@ Return all named candidates in source order. found is true when at least one dis
         client_kwargs: dict[str, Any] = {"api_key": api_key}
         if base_url:
             client_kwargs["base_url"] = base_url
+        started = time.monotonic()
         message = Anthropic(**client_kwargs).messages.create(
             model=model,
             max_tokens=max_tokens,
@@ -1922,6 +2257,10 @@ Return all named candidates in source order. found is true when at least one dis
             tool_choice={"type": "tool", "name": tool_schema["name"]},
             messages=[{"role": "user", "content": content}],
         )
+        _record_anthropic("EXTRACT_CANDIDATES", model, {
+            "model": model, "max_tokens": max_tokens, "temperature": 0, "system": system_prompt,
+            "tools": [tool_schema], "messages": [{"role": "user", "content": content}],
+        }, message, started)
         parsed = None
         for block in message.content:
             if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == tool_schema["name"]:
@@ -1946,29 +2285,30 @@ Return all named candidates in source order. found is true when at least one dis
             ],
             "response_format": {"type": "json_object"},
         }
-        if provider == "OPENAI":
-            # Current OpenAI reasoning models reject the legacy max_tokens field.
+        if provider == "OPENAI" and _is_openai_reasoning_model(model):
+            request_payload["reasoning_effort"] = _openai_reasoning_effort(model, thorough=True)
+            request_payload["max_completion_tokens"] = _REASONING_EXTRACTION_MAX_TOKENS
+        elif provider == "OPENAI":
+            # Current OpenAI models reject the legacy max_tokens field.
             request_payload["max_completion_tokens"] = max_tokens
         else:
             # Preserve the payload expected by DeepSeek and arbitrary OpenAI-compatible APIs.
             request_payload["temperature"] = 0
             request_payload["max_tokens"] = max_tokens
+        started = time.monotonic()
         response = requests.post(
             f"{base_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=request_payload,
             timeout=AI_REQUEST_TIMEOUT_SECONDS,
         )
+        _record_chat("EXTRACT_CANDIDATES", provider, model, request_payload, response, started)
         if not response.ok:
             raise RuntimeError(
                 f"{provider} chat completion failed with HTTP {response.status_code}: {response.text[:1000]}"
             )
         response_payload = response.json()
-        try:
-            output = response_payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise ValueError(f"{provider} returned an unexpected response payload") from exc
-        parsed = _extract_json(output or "")
+        parsed = _extract_json(_chat_completion_content(provider, response_payload))
     if not isinstance(parsed, dict):
         raise ValueError(f"AI extraction returned unexpected payload type: {type(parsed).__name__}")
     parsed = _normalize_extraction_payload(parsed)
@@ -2146,11 +2486,14 @@ def enrich_with_map_search(
     search_limit: int,
     headless: bool,
     progress_callback: Callable[[list[dict[str, Any]], int, int], None] | None = None,
+    map_searcher: Callable[[str, int], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
+    """``map_searcher`` replaces the browser search (see backend_place_search); None keeps it."""
     enriched: list[dict[str, Any]] = []
     LOG.info("Starting map search enrichment: candidates=%s search_limit=%s", len(candidates), search_limit)
     for processed, candidate in enumerate(candidates, start=1):
         item = dict(candidate)
+        item["mapSearchStatus"] = "DONE"
         query = _contextual_map_query(item)
         item["resolvedSearchQuery"] = query or None
         if not query:
@@ -2168,7 +2511,10 @@ def enrich_with_map_search(
             continue
         try:
             LOG.info("Map search candidate: query=%r", query)
-            raw_map_search = search_google_maps(query, limit=max(search_limit, 3), headless=headless)
+            if map_searcher is None:
+                raw_map_search = search_google_maps(query, limit=max(search_limit, 3), headless=headless)
+            else:
+                raw_map_search = map_searcher(query, max(search_limit, 3))
             verified_map_search = _verified_map_search(item, raw_map_search)
             if verified_map_search is None:
                 LOG.info(
@@ -2234,6 +2580,216 @@ def apply_map_validation(
         }
     )
     extraction["candidateValidation"] = validation
+
+
+# The frames sent to the AI are small and heavily compressed to save tokens. The picture a
+# person sees on a place card is cut again from the source at a readable size.
+CANDIDATE_IMAGE_MAX_WIDTH = 720
+CANDIDATE_IMAGE_JPEG_QUALITY = 5
+CANDIDATE_IMAGE_MAX_BYTES = 250_000
+_NUMBERED_IMAGE_RE = re.compile(r"_(\d+)\.jpg$", re.IGNORECASE)
+
+
+def _candidate_evidence_frame_index(candidate: dict[str, Any], frame_count: int) -> int | None:
+    """The 1-based frame the AI cited for this place, preferring one that shows its identity."""
+    fallback: int | None = None
+    for evidence in candidate.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        if _normalized_enum(evidence.get("source")) not in {"frame", "slide"}:
+            continue
+        try:
+            frame_index = int(evidence.get("frame_index"))
+        except (TypeError, ValueError):
+            continue
+        if not 0 < frame_index <= frame_count:
+            continue
+        if _as_bool(evidence.get("supports_identity")):
+            return frame_index
+        if fallback is None:
+            fallback = frame_index
+    return fallback
+
+
+def _higher_resolution_source(frame_path: Path) -> Path | None:
+    """The uncompressed original a carousel or metadata image was made from, when it still exists."""
+    match = _NUMBERED_IMAGE_RE.search(frame_path.name)
+    if not match:
+        return None
+    number = int(match.group(1))
+    if frame_path.parent.name == "metadata_images":
+        originals = sorted(frame_path.parent.glob(f"raw_{number:02d}.*"))
+        return originals[0] if originals else None
+    if frame_path.parent.name == "carousel_images":
+        raw_dir = frame_path.parent.parent / "carousel_raw"
+        supported = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
+        originals = sorted(
+            (path for path in raw_dir.rglob("*") if path.is_file() and path.suffix.lower() in supported),
+            key=lambda path: str(path.relative_to(raw_dir)).lower(),
+        )
+        return originals[number - 1] if 0 < number <= len(originals) else None
+    return None
+
+
+def _render_candidate_image(
+    frame_path: Path,
+    output_path: Path,
+    *,
+    media_path: Path | None,
+    frame_timestamps: list[float],
+) -> Path | None:
+    match = _NUMBERED_IMAGE_RE.search(frame_path.name)
+    if media_path is not None and match and frame_path.name.startswith("frame_"):
+        number = int(match.group(1))
+        if 0 < number <= len(frame_timestamps):
+            try:
+                _run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-ss",
+                        f"{frame_timestamps[number - 1]:.3f}",
+                        "-i",
+                        str(media_path),
+                        "-frames:v",
+                        "1",
+                        "-vf",
+                        f"scale='min({CANDIDATE_IMAGE_MAX_WIDTH},iw)':-2",
+                        "-q:v",
+                        str(CANDIDATE_IMAGE_JPEG_QUALITY),
+                        str(output_path),
+                    ],
+                    timeout=60,
+                )
+                if output_path.exists() and output_path.stat().st_size > 512:
+                    return output_path
+            except Exception:
+                LOG.debug("Candidate frame render failed: frame=%s", frame_path.name, exc_info=True)
+    source = _higher_resolution_source(frame_path) or frame_path
+    return compress_image(source, output_path, CANDIDATE_IMAGE_MAX_WIDTH, CANDIDATE_IMAGE_JPEG_QUALITY)
+
+
+def build_candidate_preview_images(
+    candidates: list[dict[str, Any]],
+    frames: list[Path],
+    *,
+    out_dir: Path,
+    media_path: Path | None = None,
+    frame_timestamps: list[float] | None = None,
+) -> dict[str, dict[str, str]]:
+    """One picture per place, cut from the frame the AI used as evidence, keyed by candidateRef.
+
+    A place named only in the voice-over has no frame and gets no picture here; the app shows
+    the video cover for it instead.
+    """
+    try:
+        return _build_candidate_preview_images(
+            candidates,
+            frames,
+            image_dir=out_dir / "candidate_images",
+            media_path=media_path,
+            frame_timestamps=frame_timestamps or [],
+        )
+    except Exception:
+        # A missing picture must never cost the user the places themselves.
+        LOG.warning("Candidate preview images failed; continuing without them", exc_info=True)
+        return {}
+
+
+def _build_candidate_preview_images(
+    candidates: list[dict[str, Any]],
+    frames: list[Path],
+    *,
+    image_dir: Path,
+    media_path: Path | None,
+    frame_timestamps: list[float],
+) -> dict[str, dict[str, str]]:
+    image_dir.mkdir(parents=True, exist_ok=True)
+    rendered: dict[int, bytes] = {}
+    images: dict[str, dict[str, str]] = {}
+    for candidate in candidates:
+        candidate_ref = str(candidate.get("candidateRef") or "").strip()
+        frame_index = _candidate_evidence_frame_index(candidate, len(frames))
+        if not candidate_ref or frame_index is None:
+            continue
+        if frame_index not in rendered:
+            output = _render_candidate_image(
+                frames[frame_index - 1],
+                image_dir / f"candidate_{frame_index:03d}.jpg",
+                media_path=media_path,
+                frame_timestamps=frame_timestamps,
+            )
+            data = output.read_bytes() if output is not None else b""
+            rendered[frame_index] = data if 0 < len(data) <= CANDIDATE_IMAGE_MAX_BYTES else b""
+        if rendered[frame_index]:
+            images[candidate_ref] = {
+                "contentType": "image/jpeg",
+                "data": base64.b64encode(rendered[frame_index]).decode("ascii"),
+            }
+    LOG.info("Candidate preview images built: candidates=%s images=%s", len(candidates), len(images))
+    return images
+
+
+def locate_candidates_progressively(
+    extraction: dict[str, Any],
+    *,
+    base_payload: dict[str, Any],
+    preview_images: dict[str, dict[str, str]],
+    search_limit: int,
+    headless: bool,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    map_searcher: Callable[[str, int], dict[str, Any]] | None = None,
+) -> None:
+    """Report every place as soon as the AI has named them, then resolve each on Maps.
+
+    The first progress report carries the whole list, each place marked
+    ``mapSearchStatus=PENDING`` with its picture, so the app can show names, descriptions and
+    images while the slow Maps lookups run. Every later report still carries the whole list:
+    places already looked up are ``DONE``, the rest stay ``PENDING``. Pictures travel only in
+    the first report; the backend keeps the URLs it stored for them.
+    """
+    candidates = extraction.get("candidates") or []
+    total = len(candidates)
+    pending = [{**candidate, "mapSearchStatus": "PENDING"} for candidate in candidates]
+
+    def publish(current: list[dict[str, Any]], processed: int) -> None:
+        if not progress_callback:
+            return
+        partial_extraction = dict(extraction)
+        partial_extraction["candidates"] = current
+        progress_callback({
+            **base_payload,
+            "success": True,
+            "partial": True,
+            "progress": {"stage": "LOCATING", "processedCandidates": processed, "totalCandidates": total},
+            "extraction": partial_extraction,
+        })
+
+    publish(
+        [
+            {**candidate, "previewImage": preview_images[candidate["candidateRef"]]}
+            if candidate.get("candidateRef") in preview_images
+            else candidate
+            for candidate in pending
+        ],
+        0,
+    )
+
+    def publish_map_progress(enriched: list[dict[str, Any]], processed: int, _total: int) -> None:
+        publish(enriched + pending[processed:], processed)
+
+    verified_candidates = enrich_with_map_search(
+        pending,
+        search_limit=search_limit,
+        headless=headless,
+        progress_callback=publish_map_progress,
+        map_searcher=map_searcher,
+    )
+    apply_map_validation(
+        extraction,
+        map_input_count=total,
+        verified_candidates=verified_candidates,
+    )
 
 
 def prepare_social_media_inputs(
@@ -2380,6 +2936,7 @@ def complete_carousel_extraction(
     ai_model: str | None,
     ai_base_url: str | None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    map_searcher: Callable[[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     transcript_provider = "skipped:image_carousel"
     if dry_run:
@@ -2452,14 +3009,14 @@ def complete_carousel_extraction(
     extraction = retain_certain_candidates(extraction, transcript="", frame_count=len(images))
     candidates = extraction.get("candidates") or []
     if include_map_search and candidates:
-        def publish_progress(enriched: list[dict[str, Any]], processed: int, total: int) -> None:
-            if not progress_callback:
-                return
-            partial_extraction = dict(extraction)
-            partial_extraction["candidates"] = enriched
-            progress_callback({
-                "success": True,
-                "partial": True,
+        preview_images = build_candidate_preview_images(
+            candidates,
+            images,
+            out_dir=temp_dir,
+        ) if progress_callback else {}
+        locate_candidates_progressively(
+            extraction,
+            base_payload={
                 "url": url,
                 "language": language,
                 "metadata": metadata,
@@ -2470,20 +3027,12 @@ def complete_carousel_extraction(
                     "transcriptAvailable": False,
                     "frameCount": len(images),
                 },
-                "progress": {"processedCandidates": processed, "totalCandidates": total},
-                "extraction": partial_extraction,
-            })
-
-        verified_candidates = enrich_with_map_search(
-            candidates,
+            },
+            preview_images=preview_images,
             search_limit=map_search_limit,
             headless=headless,
-            progress_callback=publish_progress,
-        )
-        apply_map_validation(
-            extraction,
-            map_input_count=len(candidates),
-            verified_candidates=verified_candidates,
+            progress_callback=progress_callback,
+            map_searcher=map_searcher,
         )
     return {
         "success": True,
@@ -2502,6 +3051,21 @@ def complete_carousel_extraction(
         "extraction": extraction,
         "tempDir": str(temp_dir) if keep_temp else None,
     }
+
+
+def _transcribe_media(
+    media_path: Path,
+    out_dir: Path,
+    audio_seconds: int | float,
+    timings: dict[str, float],
+) -> tuple[Path | None, str, str]:
+    with _timed(timings, "audio"):
+        audio_path = extract_audio(media_path, out_dir, audio_seconds)
+    if not audio_path:
+        return None, "", "skipped:no_audio"
+    with _timed(timings, "transcript"):
+        transcript, provider = transcribe_audio(audio_path)
+    return audio_path, transcript, provider
 
 
 def extract_social_location(
@@ -2524,8 +3088,11 @@ def extract_social_location(
     ai_model: str | None = None,
     ai_base_url: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    map_searcher: Callable[[str, int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     temp_dir = Path(tempfile.mkdtemp(prefix="social_location_"))
+    timings: dict[str, float] = {}
+    started_at = time.monotonic()
     LOG.info(
         "Social extraction started: url=%s temp_dir=%s language=%s dry_run=%s max_audio_seconds=%s max_frames=%s frame_interval_seconds=%s image_max_width=%s jpeg_q=%s candidate_policy=%s include_map_search=%s",
         url,
@@ -2542,7 +3109,8 @@ def extract_social_location(
     )
     try:
         source_url = resolve_social_url(url)
-        carousel_images = download_carousel_images(source_url, temp_dir, image_max_width, image_jpeg_quality)
+        with _timed(timings, "carousel_probe"):
+            carousel_images = download_carousel_images(source_url, temp_dir, image_max_width, image_jpeg_quality)
         if len(carousel_images) >= 2:
             carousel_info = extract_carousel_metadata(source_url)
             carousel_metadata = _metadata_context(carousel_info)
@@ -2567,12 +3135,13 @@ def extract_social_location(
                 ai_model=ai_model,
                 ai_base_url=ai_base_url,
                 progress_callback=progress_callback,
+                map_searcher=map_searcher,
             )
 
-        info, download_profile = extract_metadata(source_url)
+        info, _download_profile, media_path = fetch_video(source_url, temp_dir, max_duration_seconds, timings)
         metadata = _metadata_context(info)
         duration = _positive_float(metadata.get("duration"))
-        if duration is not None and duration > max_duration_seconds:
+        if media_path is None:
             return {
                 "success": False,
                 "rejectedStatus": "REJECTED_DURATION",
@@ -2585,12 +3154,6 @@ def extract_social_location(
                     "maxDurationSeconds": max_duration_seconds,
                 },
             }
-        media_path = download_media(
-            source_url,
-            temp_dir,
-            preferred_profile=download_profile,
-            media_url=info.get("_embed_media_url"),
-        )
         if duration is None:
             duration = probe_media_duration(media_path)
             if duration is not None:
@@ -2624,26 +3187,36 @@ def extract_social_location(
         audio_seconds = max_audio_seconds
         if audio_seconds is None:
             audio_seconds = metadata.get("duration") or 600
-        audio_path = extract_audio(media_path, temp_dir, audio_seconds)
-        transcript = ""
-        transcript_provider = "skipped:no_audio"
-        if audio_path:
-            transcript, transcript_provider = transcribe_audio(audio_path)
+        # The transcript (hosted API or local Whisper) and the frames (ffmpeg) do not depend on
+        # each other, so they run at the same time instead of one after the other.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="social-transcript") as pool:
+            transcript_job = pool.submit(_transcribe_media, media_path, temp_dir, audio_seconds, timings)
+            with _timed(timings, "frames"):
+                frames = extract_frames(
+                    media_path,
+                    temp_dir,
+                    max_frames,
+                    frame_interval_seconds,
+                    image_max_width,
+                    image_jpeg_quality,
+                    metadata.get("duration"),
+                )
+            audio_path, transcript, transcript_provider = transcript_job.result()
 
-        # Cheap text-only triage before the expensive part (ffmpeg frame
-        # extraction + the full vision LLM call). Only ever short-circuits on
-        # a confident "clearly unrelated" verdict; anything else falls
-        # through to the unchanged full pipeline below. Dry runs skip this so
+        # Cheap text-only triage before the expensive part, the full vision LLM call.
+        # Only ever short-circuits on a confident "clearly unrelated" verdict; anything
+        # else falls through to the unchanged full pipeline below. Dry runs skip this so
         # debug artifacts always reflect the full pipeline.
         if not dry_run:
-            prefilter_rejection = prefilter_topic_relevance(
-                metadata=metadata,
-                transcript=transcript,
-                language=language,
-                ai_provider=ai_provider,
-                ai_model=ai_model,
-                ai_base_url=ai_base_url,
-            )
+            with _timed(timings, "prefilter"):
+                prefilter_rejection = prefilter_topic_relevance(
+                    metadata=metadata,
+                    transcript=transcript,
+                    language=language,
+                    ai_provider=ai_provider,
+                    ai_model=ai_model,
+                    ai_base_url=ai_base_url,
+                )
             if prefilter_rejection is not None:
                 return {
                     "success": False,
@@ -2655,7 +3228,7 @@ def extract_social_location(
                         "downloaded": True,
                         "audioProvider": transcript_provider,
                         "transcriptAvailable": bool(transcript),
-                        "frameCount": 0,
+                        "frameCount": len(frames),
                     },
                     "extraction": {
                         "is_relevant": False,
@@ -2678,17 +3251,6 @@ def extract_social_location(
                     },
                 }
 
-        # Extract frames với interval có thể None (auto calculate từ duration)
-        actual_interval = frame_interval_seconds
-        frames = extract_frames(
-            media_path,
-            temp_dir,
-            max_frames,
-            actual_interval,
-            image_max_width,
-            image_jpeg_quality,
-            metadata.get("duration"),
-        )
         if len(frames) < 2:
             LOG.info("Few frames extracted; trying metadata images: current_frames=%s", len(frames))
             frames = frames + download_metadata_images(
@@ -2747,16 +3309,17 @@ def extract_social_location(
             LOG.info("Social dry-run completed: url=%s output_dir=%s", url, artifacts.get("outputDir"))
             return result
 
-        extraction = extract_candidates_with_ai(
-            metadata=metadata,
-            transcript=transcript,
-            transcript_provider=transcript_provider,
-            image_paths=frames,
-            language=language,
-            ai_provider=ai_provider,
-            ai_model=ai_model,
-            ai_base_url=ai_base_url,
-        )
+        with _timed(timings, "ai"):
+            extraction = extract_candidates_with_ai(
+                metadata=metadata,
+                transcript=transcript,
+                transcript_provider=transcript_provider,
+                image_paths=frames,
+                language=language,
+                ai_provider=ai_provider,
+                ai_model=ai_model,
+                ai_base_url=ai_base_url,
+            )
 
         if not bool(extraction.get("is_relevant")):
             reason = str(extraction.get("relevance_reason") or "Video is not about travel, food, or a place review")
@@ -2783,39 +3346,38 @@ def extract_social_location(
         )
         candidates = extraction.get("candidates") or []
         if include_map_search and candidates:
-            def publish_progress(enriched: list[dict[str, Any]], processed: int, total: int) -> None:
-                if not progress_callback:
-                    return
-                partial_extraction = dict(extraction)
-                partial_extraction["candidates"] = enriched
-                progress_callback({
-                    "success": True,
-                    "partial": True,
-                    "url": url,
-                    "language": language,
-                    "metadata": metadata,
-                    "media": {
-                        "downloaded": True,
-                        "mediaType": "VIDEO",
-                        "audioProvider": transcript_provider,
-                        "transcriptAvailable": bool(transcript),
-                        "frameCount": len(frames),
-                    },
-                    "progress": {"processedCandidates": processed, "totalCandidates": total},
-                    "extraction": partial_extraction,
-                })
-
-            candidates = enrich_with_map_search(
+            preview_images = build_candidate_preview_images(
                 candidates,
-                search_limit=map_search_limit,
-                headless=headless,
-                progress_callback=publish_progress,
-            )
-            apply_map_validation(
-                extraction,
-                map_input_count=len(extraction.get("candidates") or []),
-                verified_candidates=candidates,
-            )
+                frames,
+                out_dir=temp_dir,
+                media_path=media_path,
+                frame_timestamps=_frame_timestamps(
+                    max_frames=max_frames,
+                    interval_seconds=float(frame_interval_seconds),
+                    duration_seconds=_positive_float(metadata.get("duration")),
+                ),
+            ) if progress_callback else {}
+            with _timed(timings, "maps"):
+                locate_candidates_progressively(
+                    extraction,
+                    base_payload={
+                        "url": url,
+                        "language": language,
+                        "metadata": metadata,
+                        "media": {
+                            "downloaded": True,
+                            "mediaType": "VIDEO",
+                            "audioProvider": transcript_provider,
+                            "transcriptAvailable": bool(transcript),
+                            "frameCount": len(frames),
+                        },
+                    },
+                    preview_images=preview_images,
+                    search_limit=map_search_limit,
+                    headless=headless,
+                    progress_callback=progress_callback,
+                    map_searcher=map_searcher,
+                )
 
         result = {
             "success": True,
@@ -2860,6 +3422,12 @@ def extract_social_location(
         LOG.exception("Social extraction failed: url=%s", url)
         return {"success": False, "url": url, "error": {"code": "EXTRACTION_FAILED", "message": str(exc)}}
     finally:
+        LOG.info(
+            "Social extraction timing: url=%s total=%.1fs steps=%s",
+            url,
+            time.monotonic() - started_at,
+            json.dumps(timings),
+        )
         if not keep_temp:
             LOG.info("Cleaning temp dir: %s", temp_dir)
             shutil.rmtree(temp_dir, ignore_errors=True)

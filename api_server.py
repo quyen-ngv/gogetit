@@ -11,6 +11,7 @@ Usage:
 
 import logging
 import sys
+import threading
 import time
 from typing import Any, Literal
 from uuid import UUID
@@ -21,6 +22,8 @@ from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+import ai_call_log
+from backend_place_search import MAP_SEARCH_PROVIDER_SCRAPE, build_map_searcher
 from config import (
     GOROUTE_PLACES_URL,
     GOROUTE_REVIEW_REFRESH_URL,
@@ -47,7 +50,7 @@ from place_searcher import search_google_maps
 from place_urls import is_google_maps_url, is_google_maps_viewport_url
 from run_job import DEFAULT_MAX_REVIEWS, setup_logging
 from nationwide_job import run_nationwide_job
-from social_location_extractor import extract_social_location, is_social_video_url
+from social_location_extractor import extract_social_location, is_social_video_url, warm_up_local_transcriber
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -318,6 +321,14 @@ class SocialLocationJobRequest(SocialLocationExtractRequest):
     callback_url: str = Field(..., description="GoRoute backend URL for incremental progress and final callbacks")
     callback_token: str = Field("", max_length=500, description="Shared token sent with social-location callbacks")
     goroute_job_id: str | None = Field(None, description="GoRoute-owned job ID for callback correlation")
+    map_search_provider: str = Field(
+        MAP_SEARCH_PROVIDER_SCRAPE,
+        max_length=20,
+        description="SCRAPE searches Google Maps in the browser; GOOGLE asks map_search_url (backend Places API)",
+    )
+    map_search_url: str | None = Field(
+        None, max_length=500, description="Backend place-search endpoint, called with callback_token"
+    )
 
     @field_validator("callback_url")
     @classmethod
@@ -655,6 +666,8 @@ def create_social_location_job(body: SocialLocationJobRequest) -> dict[str, Any]
                     callback_result.get("error"),
                 )
         
+        # Every AI call of this job is logged next to the callback, grouped by the backend job id.
+        log_binding = ai_call_log.bind(body.callback_url, body.callback_token, body.goroute_job_id)
         try:
             result = extract_social_location(
                 body.url,
@@ -675,6 +688,12 @@ def create_social_location_job(body: SocialLocationJobRequest) -> dict[str, Any]
                 ai_model=body.ai_model,
                 ai_base_url=body.ai_base_url,
                 progress_callback=publish_progress,
+                map_searcher=build_map_searcher(
+                    provider=body.map_search_provider,
+                    url=body.map_search_url,
+                    token=body.callback_token,
+                    headless=body.headless,
+                ),
             )
             success = bool(result.get("success"))
             raw_error = result.get("error")
@@ -686,6 +705,8 @@ def create_social_location_job(body: SocialLocationJobRequest) -> dict[str, Any]
             success = False
             error_message = f"Extraction exception: {type(exc).__name__}: {str(exc)}"
             result = {"success": False, "error": error_message}
+        finally:
+            ai_call_log.unbind(log_binding)
         
         # Luôn gọi callback dù có lỗi hay không
         callback_error = result.get("error") if isinstance(result, dict) else None
@@ -1090,6 +1111,10 @@ def import_raw_endpoint(body: ImportRawRequest) -> dict[str, Any]:
 def on_startup() -> None:
     global refresh_scheduler
     setup_logging("WARNING", "api_scraper.log")
+    # A handful of lines per social video job: the only record of how long
+    # download, transcript, frames and the AI call each took.
+    logging.getLogger("social_location_extractor").setLevel(logging.INFO)
+    threading.Thread(target=warm_up_local_transcriber, name="whisper-warm-up", daemon=True).start()
     if (PLACE_REFRESH_ENABLED or PLACE_REVIEW_REFRESH_ENABLED) and refresh_scheduler is None:
         refresh_scheduler = BackgroundScheduler(timezone=PLACE_REFRESH_TIMEZONE)
     if PLACE_REFRESH_ENABLED and refresh_scheduler is not None:

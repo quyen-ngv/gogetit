@@ -40,7 +40,9 @@ COPY job_store.py .
 COPY contribution_import.py .
 COPY place_resolver.py .
 COPY place_searcher.py .
+COPY backend_place_search.py .
 COPY social_location_extractor.py .
+COPY social_eval.py .
 COPY config.py .
 COPY place_pipeline.py .
 COPY place_refresh_job.py .
@@ -55,6 +57,10 @@ COPY start.sh .
 RUN sed -i 's/\r$//' /app/start.sh \
     && chmod +x /app/start.sh \
     && mkdir -p /app/logs /app/output /app/model-cache
+
+# Bake the local Whisper model into the image; otherwise every new container downloads it
+# during its first social video job. Must match LOCAL_WHISPER_MODEL / LOCAL_WHISPER_CACHE_DIR.
+RUN python -c "from faster_whisper.utils import download_model; download_model('small', cache_dir='/app/model-cache')"
 
 # Catch missing runtime modules/configuration during image build, not at startup.
 RUN gallery-dl --version \
