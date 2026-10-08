@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import re
 
 from config import goroute_api_headers
+from place_classification import current_group, derive_place_group, derive_sub_types, google_categories
 
 try:
     import requests
@@ -113,22 +114,13 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
     emails_str = _json_field_string(place.get("emails"), "[]")
     raw_data_str = _json_field_string(place.get("rawData"), "{}")
     
-    # Determine placeGroup from category if not set
-    place_group = place.get("placeGroup", "OTHER")
-    if not place_group or place_group == "OTHER":
-        category_lower = (place.get("category", "") or "").lower()
-        if any(word in category_lower for word in ["restaurant", "cafe", "food", "pho", "bar", "eatery", "bistro", "diner", "noodle", "bun", "com", "banh"]):
-            place_group = "FOOD_AND_DRINK"
-        elif any(word in category_lower for word in ["hotel", "resort", "hostel", "accommodation", "lodging", "motel", "guesthouse"]):
-            place_group = "ACCOMMODATION"
-        elif any(word in category_lower for word in ["museum", "temple", "pagoda", "church", "heritage", "historical", "monument", "shrine", "cultural"]):
-            place_group = "CULTURE_AND_HERITAGE"
-        elif any(word in category_lower for word in ["park", "beach", "mountain", "nature", "garden", "forest", "lake", "waterfall", "outdoor"]):
-            place_group = "NATURE_AND_OUTDOORS"
-        elif any(word in category_lower for word in ["shop", "store", "market", "mall", "shopping", "boutique"]):
-            place_group = "SHOPPING_AND_MARKET"
-        elif any(word in category_lower for word in ["attraction", "tourist", "landmark", "viewpoint", "entertainment", "amusement"]):
-            place_group = "ATTRACTIONS"
+    categories = google_categories(place)
+    # A legacy group still names its kinds (NATURE_AND_OUTDOORS -> NATURE) before it folds into ATTRACTIONS.
+    scraped_group = (place.get("placeGroup") or "").upper()
+    sub_types = derive_sub_types(categories, scraped_group)
+    place_group = current_group(scraped_group)
+    if not place_group or scraped_group == "OTHER":
+        place_group = derive_place_group(categories)
     
     # Build API request body
     api_body = {
@@ -139,6 +131,7 @@ def format_place_for_api(place: dict[str, Any]) -> dict[str, Any]:
         "translations": translations,
         "category": place.get("category", ""),
         "placeGroup": place_group,
+        "subTypes": sub_types,
         "address": place.get("address", ""),
         "destinations": destinations,  # Keep as array
         "latitude": float(place.get("latitude")) if place.get("latitude") is not None else None,

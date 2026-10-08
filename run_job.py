@@ -31,6 +31,7 @@ except ImportError as exc:  # pragma: no cover - environment error
     ) from exc
 
 from browser_runtime import acquire_browser_slot, release_browser_slot
+from place_classification import derive_place_group
 from config import (
     PLACE_BROWSER_COMMAND_TIMEOUT_SECONDS,
     PLACE_BROWSER_BLOCK_IMAGES,
@@ -1940,21 +1941,8 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
         if cid_match:
             cid = cid_match.group(1)
     
-    # Determine place group from category
-    place_group = "OTHER"
-    category_lower = category.lower()
-    if any(word in category_lower for word in ["restaurant", "cafe", "food", "pho", "bar", "eatery", "bistro", "diner", "noodle", "bun", "com", "banh"]):
-        place_group = "FOOD_AND_DRINK"
-    elif any(word in category_lower for word in ["hotel", "resort", "hostel", "accommodation", "lodging", "motel", "guesthouse"]):
-        place_group = "ACCOMMODATION"
-    elif any(word in category_lower for word in ["museum", "temple", "pagoda", "church", "heritage", "historical", "monument", "shrine", "cultural"]):
-        place_group = "CULTURE_AND_HERITAGE"
-    elif any(word in category_lower for word in ["park", "beach", "mountain", "nature", "garden", "forest", "lake", "waterfall", "outdoor"]):
-        place_group = "NATURE_AND_OUTDOORS"
-    elif any(word in category_lower for word in ["shop", "store", "market", "mall", "shopping", "boutique"]):
-        place_group = "SHOPPING_AND_MARKET"
-    elif any(word in category_lower for word in ["attraction", "tourist", "landmark", "viewpoint", "entertainment", "amusement"]):
-        place_group = "ATTRACTIONS"
+    # Whole-word match over every Google category (see place_classification).
+    place_group = derive_place_group([category, *categories])
     
     # Extract timezone from coordinates (simple approximation for Vietnam)
     timezone = "Asia/Saigon" if lat and lng and 8 < lat < 24 and 102 < lng < 110 else "UTC"
