@@ -52,6 +52,7 @@ COPY nationwide_job.py .
 COPY nationwide_regions.py .
 COPY nationwide_search_config.json .
 COPY place_urls.py .
+COPY place_classification.py .
 COPY start.sh .
 
 # Fix Windows CRLF + ensure executable (CRLF breaks shebang on Linux)
