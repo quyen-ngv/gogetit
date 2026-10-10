@@ -1538,6 +1538,8 @@ GOOGLE_VIDEO_VARIANT = re.compile(r"=(m\d+|mm,[^=]*|\d+)$")
 # Indices into the place array (index 6) of Google's /maps/preview/place payload.
 PREVIEW_HERO_PHOTO_PATH = (72, 0, 0, 6, 0)
 PREVIEW_LOCAL_NAME_INDEX = 101
+# Cover thumbnail plus gallery photos kept per place.
+MAX_PLACE_IMAGES = 8
 
 
 def fetch_preview_place(driver) -> list[Any] | None:
@@ -2007,7 +2009,7 @@ def js_place_detail(driver, input_url: str, resolved_url: str) -> dict[str, Any]
             if not (isinstance(img, dict) and img.get("image", "").split("=", 1)[0] == thumb_base)
         ]
         images.insert(0, {"title": title, "image": thumbnail})
-        images = images[:30]
+    images = images[:MAX_PLACE_IMAGES]
 
     menu_data_raw = menu_actions.get("data", []) if isinstance(menu_actions, dict) else []
     if not menu_data_raw and isinstance(menu_actions, dict):
