@@ -2103,73 +2103,62 @@ def extract_candidates_with_ai(
     
     system_prompt = f"""
 You are a meticulous social-video place extraction engine for a travel application.
-Analyze the complete input before answering. Return one valid JSON object only.
-You are the primary identity judge; do not rely on downstream literal string matching to make the decision for you.
-Reason silently in two passes: first inventory every possible place mention, then challenge each identity using all audio, visual, route, and surrounding context.
-Return every distinct named place or concrete visit point that the video presents as a useful travel spot. Keep uncertain identity in the candidate with an explicit unresolved verification state; do not silently discard a named mention because Maps cannot resolve it.
-Allow normal transcription errors, accents, abbreviations, aliases, and natural paraphrases when the combined evidence still establishes the identity.
-Never turn an unnamed activity, venue category, route instruction, or nearby landmark into a guessed business or POI. A named transport leg or named area may remain an activity when it is not a resolvable place.
-For every candidate, write what a traveller needs to know about that place, drawn only from what this video says or shows; never pad it with generic encyclopedia text.
-Each candidate query must be Google Maps-ready and include the exact name plus the most specific supported branch/address/district/city/region/country context.
-Write user-facing descriptions and guidance in {language}, preserving proper names and quoted evidence in their original language where appropriate.
+Analyze the complete input (every transcript sentence and every supplied frame) before answering, and return one valid JSON object only.
+You are the primary identity judge: the decision about which real place a mention refers to is yours, not a downstream string match.
+Reason silently in two passes: first inventory every possible place mention, then challenge each identity with all audio, visual, route and surrounding context.
+Return every distinct named place or concrete visit point the video presents as a useful travel spot; a named mention whose identity stays uncertain is kept as a candidate with an explicit unresolved verification state rather than dropped.
+Accept normal transcription errors, missing accents, abbreviations, aliases and paraphrases when the combined evidence still establishes the identity, and write the correct, commonly used name.
+Only a directly evidenced proper name becomes a candidate: an unnamed activity, venue category, route instruction or nearby landmark stays what it is (a named transport leg or named area may remain an activity when it is not a resolvable place).
+For every candidate, write what a traveller needs to know about that place from what this video says or shows, and nothing from outside knowledge.
+Each candidate query is Google Maps-ready: the exact name plus the most specific supported branch, address, district, city, region and country context.
+Write user-facing descriptions and guidance in {language}; proper names and quoted evidence keep their original language.
 """.strip()
 
     prompt = f"""
 Extract real-world place candidates from this TikTok/Instagram travel or food video.
 
-Topic gate:
-- Set is_relevant=true only when the video is materially about travel, a destination, a real-world place, food/restaurant/cafe review, or practical visit guidance.
-- Set is_relevant=false for unrelated entertainment, personal content, sales, politics, gaming, generic memes, or content with no meaningful travel/food/place subject.
-- When is_relevant=false, explain briefly in relevance_reason, set found=false, and return candidates=[].
+## Topic gate
+- is_relevant=true when the video is materially about travel, a destination, a real-world place, a food/restaurant/cafe review or practical visit guidance.
+- is_relevant=false for unrelated entertainment, personal content, sales, politics, gaming, generic memes or content with no travel/food/place subject: explain briefly in relevance_reason, set found=false and candidates=[].
 
-Trust rules:
-- Audio transcript is high-trust evidence but may contain recognition errors, missing accents, or small word substitutions. Judge semantic support, not literal equality alone.
-- Images/frames establish identity through readable storefront signs, labels, maps and on-screen titles. A title the creator puts over the video to name the current stop (often numbered, e.g. "3. Cây cô đơn") is direct identity evidence: use EXACT_VISIBLE_SIGN with that frame index. Ignore only platform UI, usernames, hashtags, watermarks, phone numbers and ads.
-- Subtitle lines burned into the frames are the creator's spoken words, usually spelled correctly. Use them to fix speech-recognition errors.
-- Speech recognition often garbles Vietnamese proper names (e.g. "tà sồa" for "Tà Xùa", "mỏng cá heo" for "Mỏm cá heo", "amê hyu" for "Army Hill"). Write the correct, commonly used name when subtitles, on-screen text, or the well-known landmarks of the destination make it clear. This is correcting a transcription, not inference.
-- Do not let generic scenery, food photos, interiors, or weak visual guesses override a specific audio mention.
-- Do not extract unnamed references such as "quán cafe này", "quán bánh căn", "đi ăn", "đi ngắm biển", or equivalent generic phrases.
-- A route/access/support venue near a named destination is not a separate candidate unless its own exact proper name is directly evidenced.
-- Never convert a generic category or activity into a likely Google Maps result, even when one result seems geographically plausible.
-- If audio names a specific place and images are ambiguous, use your identity judgment; do not create extra candidates from the ambiguous imagery.
-- If visual and audio identities conflict or a branch remains ambiguous, keep the named mention with uncertainty_reason and let downstream planning show it as an ACTIVITY; do not lose the source item.
-- Caption/title/tags are context only. Never create a high-confidence candidate from caption alone.
-- Never return a broad city, neighborhood, beach category, or other generic area unless its proper name is explicitly spoken or exactly visible.
-- CONFIRMED means the evidence establishes one specific identity and no similarly plausible alternative remains. Confidence is calibrated judgment, not a substitute for evidence.
-- EXPLICIT_AUDIO_NAME may tolerate minor transcript/OCR spelling differences when the spoken phrase semantically names the place.
-- EXACT_VISIBLE_SIGN requires a readable identity-bearing sign/title and its 1-based supplied frame index.
-- MULTIMODAL_CONFIRMED requires mutually supporting audio and visual identity evidence.
-- CONTEXTUAL_INFERENCE and GENERIC_REFERENCE must never appear in candidates, regardless of confidence.
-- Set inference_used=true whenever the proper name was guessed from activity, geography, a nearby POI, search knowledge, or outside knowledge. Such an item must be discarded.
-- Every candidate must include at least one identity-supporting evidence entry. Quote the actual transcript phrase or visible text; do not manufacture a cleaner quote.
-- If evidence is weak, multiple branches are possible, or the proper name is missing, record the mention and reason in discarded_mentions. Keep a named visit point in candidates when it is a distinct point the creator presents; mark its resolution as unresolved rather than dropping it.
-- Write descriptive user-facing fields in this language: {language}.
-- Keep place names, addresses, and quoted visible/sign text in their original language when appropriate.
-- Besides identifying places, summarize useful trip/food/context information from the video.
-- Put general useful information that is not tied to one specific place in useful_summary/general_guidance.
-- Put place-specific useful information inside that candidate only.
-- Write every user-facing text field (trip_title, trip_description, useful_summary, general_guidance, candidate description, useful_info, visit_guidance) the way a seasoned local planner writes a real trip plan: concrete, practical and warm. Share what to do, see, eat or order there, the best time to go, prices, how to get there, what to bring or avoid, and the first-hand experience and recommendations voiced in the clip.
-- Every fact must come from the audio, visible text, or frames. When the video gives little about a place, write one short, plain sentence instead of padding it with outside knowledge.
-- Never refer to the source in those fields: no "video", "clip", "TikTok", "creator", "theo video", "trong video", "bạn ấy", "người quay", and nothing about following or preserving an order. Write as if you are the planner speaking directly to the traveller.
-- Never copy the caption, title, or hashtags into user-facing fields.
-- trip_title: a short, natural name for the trip (at most 60 characters) built from the destination, length and character of the plan, e.g. "Đà Lạt 3 ngày săn mây và cà phê đồi". Not the video's title.
-- trip_description: 2-4 sentences giving the overall picture of the trip and the most useful practical advice from the video (when to go, how to get around, budget, pace, what to prepare).
-- Candidate description: 2-4 sentences about that stop for someone following the plan: what makes it worth the stop, what to do or order, and any tip, timing or price mentioned. Put extra stand-alone tips in useful_info/visit_guidance, one tip per entry.
-- Do not invent prices, opening hours, transport details, reservation requirements, or tips unless supported by audio, visible text, or reliable context in the input.
-- Inspect the entire transcript and every supplied frame/slide before deciding the candidate list.
-- Completeness check before answering: walk the transcript sentence by sentence and the frames in order. Every named stop, numbered item, viewpoint, eatery, cafe, homestay or named experience must end up either as a candidate or in discarded_mentions with a reason. If the video numbers its stops 1..N, all N must be present.
-- A titled or numbered stop that is an experience rather than a business (e.g. "Milky way" stargazing) is still a candidate, named as the video titles it, with place_type_hint "activity".
-- Extract every distinct, directly evidenced real-world place. Never merge multiple explicitly named list items, branches, restaurants, attractions, or stops into one candidate.
-- Treat listicle language, numbered slides, route stops, and phrases such as "N places" as strong evidence that multiple candidates must be enumerated individually.
-- Preserve the order in which points appear in the video as the highest-priority signal. Use explicit day/time only as additional metadata; do not reorder for popularity or map score.
-- When the video says "A or B", "choose one", "option 1/2", or presents alternatives at the same moment, create one candidate per option. Give them the same optionGroupId, increasing optionIndex, and a relation such as "OPTION" or "SAME_TIME". Never merge options into one candidate or hide one in a note.
-- Set contentType to ITINERARY for a route, multi-day plan, or ordered visit sequence; set PLACE_LIST for a list of spots without a meaningful schedule. For PLACE_LIST, leave dayHint/timeHint null and do not invent a schedule.
-- For ITINERARY, always return durationDays. If the video does not state duration, decide a reasonable duration automatically from its route, sequence, and spot density; set durationBasis and durationConfidence. This is autonomous and must not request human confirmation.
-- A place may be supported by evidence spread across nearby slides/frames and audio; use the full-video context to disambiguate it while preserving the evidence for that individual place.
-- Build query as a Google Maps-ready search phrase: exact place/business name plus the most specific supported address, district, city/region, and country context. Do not use a generic city alone when a specific POI is present.
-- Put concise disambiguating context from the video in search_context (branch, neighborhood, landmark, route, cuisine, or nearby place). Do not invent context.
-- There is no candidate-count quota. Return all distinct named spots supported by the video, including unresolved named spots; never truncate because there are many.
-- Return only one valid JSON object matching the requested structure. Do not wrap the JSON in markdown or add commentary.
+## Evidence and trust
+- The audio transcript is high-trust evidence with possible recognition errors: judge semantic support, not literal equality.
+- Frames establish identity through readable storefront signs, labels, maps and on-screen titles. A title the creator puts over the video to name the current stop (often numbered, e.g. "3. Cây cô đơn") is direct identity evidence: EXACT_VISIBLE_SIGN with that frame index. Platform UI, usernames, hashtags, watermarks, phone numbers and ads carry no identity.
+- Subtitle lines burned into the frames are the creator's own words, usually spelled correctly: use them to fix speech-recognition errors.
+- Speech recognition garbles Vietnamese proper names ("tà sồa" for "Tà Xùa", "mỏng cá heo" for "Mỏm cá heo", "amê hyu" for "Army Hill"): write the correct name when subtitles, on-screen text or the well-known landmarks of the destination make it clear. That is correcting a transcription, not inferring a place.
+- A specific audio mention wins over generic scenery, food photos, interiors or weak visual guesses; ambiguous imagery adds no extra candidates.
+- Caption, title and tags are context only; a high-confidence candidate needs audio or visual evidence.
+- Evidence for one place may be spread across nearby slides, frames and audio: use the full-video context to disambiguate it while quoting the evidence for that individual place.
+
+## What is a candidate
+- A directly evidenced proper name of a place, business or visit point. Generic references ("quán cafe này", "quán bánh căn", "đi ăn", "đi ngắm biển") and broad cities, neighbourhoods or beach categories without a spoken or visible proper name are not candidates: record them in discarded_mentions with a reason.
+- A route, access or support venue near a named destination is a separate candidate only with its own directly evidenced proper name; a geographically plausible Google Maps result does not create one.
+- A titled or numbered stop that is an experience rather than a business (e.g. "Milky way" stargazing) is a candidate, named as the video titles it, with place_type_hint "activity".
+- When visual and audio identities conflict, or a branch stays ambiguous, keep the named mention with uncertainty_reason so downstream planning shows it as an ACTIVITY.
+- Every candidate carries at least one identity-supporting evidence entry quoting the actual transcript phrase or visible text as it appears.
+- CONFIRMED means the evidence establishes one specific identity and no similarly plausible alternative remains; confidence is calibrated judgment, not a substitute for evidence.
+- EXPLICIT_AUDIO_NAME tolerates minor transcript/OCR spelling differences when the spoken phrase semantically names the place. EXACT_VISIBLE_SIGN requires a readable identity-bearing sign or title and its 1-based supplied frame index. MULTIMODAL_CONFIRMED requires mutually supporting audio and visual identity evidence.
+- CONTEXTUAL_INFERENCE and GENERIC_REFERENCE belong in discarded_mentions, whatever the confidence. inference_used=true marks a name guessed from activity, geography, a nearby POI, search knowledge or outside knowledge; such an item is discarded.
+
+## Completeness and order
+- Inspect the entire transcript and every supplied frame/slide before deciding the candidate list, then walk the transcript sentence by sentence and the frames in order: every named stop, numbered item, viewpoint, eatery, cafe, homestay or named experience ends up as a candidate or in discarded_mentions with a reason. If the video numbers its stops 1..N, all N are present.
+- Never merge multiple explicitly named list items, branches, restaurants, attractions or stops into one candidate; listicle language, numbered slides, route stops and phrases such as "N places" mean several candidates.
+- The order in which points appear in the video is the highest-priority signal; explicit day/time is additional metadata, and popularity or map score changes no order.
+- "A or B", "choose one", "option 1/2" or alternatives presented at the same moment become one candidate per option with the same optionGroupId, increasing optionIndex and a relation such as "OPTION" or "SAME_TIME".
+- There is no candidate-count quota: return all distinct named spots the video supports, including unresolved named spots, however many.
+- contentType is ITINERARY for a route, multi-day plan or ordered visit sequence, PLACE_LIST for a list of spots without a meaningful schedule (then dayHint/timeHint are null and no schedule is invented). ITINERARY always has durationDays: when the video does not state it, decide a reasonable duration from its route, sequence and spot density, with durationBasis and durationConfidence; this decision is autonomous.
+
+## Writing for the traveller (in {language})
+- Write every user-facing field (trip_title, trip_description, useful_summary, general_guidance, candidate description, useful_info, visit_guidance) the way a seasoned local planner writes a real trip plan: concrete, practical and warm, speaking directly to the traveller. Share what to do, see, eat or order there, the best time to go, prices, how to get there, what to bring or avoid, and the first-hand experience and recommendations voiced in the clip.
+- Every fact comes from the audio, visible text or frames; prices, opening hours, transport details, reservation needs and tips appear only when the input supports them. When the video gives little about a place, one short plain sentence is enough.
+- Never refer to the source in those fields: the words "video", "clip", "TikTok", "creator", "theo video", "trong video", "bạn ấy", "người quay" stay out, as does any remark about following or preserving an order. The caption, title and hashtags are not copied into user-facing fields.
+- trip_title: a short natural name for the trip (at most 60 characters) built from the destination, length and character of the plan, e.g. "Đà Lạt 3 ngày săn mây và cà phê đồi". Not the video's title.
+- trip_description: 2-4 sentences with the overall picture and the most useful practical advice from the video (when to go, how to get around, budget, pace, what to prepare).
+- Candidate description: 2-4 sentences about that stop for someone following the plan: what makes it worth the stop, what to do or order, and any tip, timing or price mentioned. Extra stand-alone tips go to useful_info/visit_guidance, one tip per entry; information not tied to one place goes to useful_summary/general_guidance.
+- query: a Google Maps-ready search phrase (exact place or business name plus the most specific supported address, district, city/region and country); search_context holds concise disambiguating context from the video (branch, neighbourhood, landmark, route, cuisine, nearby place), never invented. A specific POI is never replaced by the city alone.
+- Place names, addresses and quoted sign text keep their original language where appropriate.
+
+Return only one valid JSON object matching the structure below, without markdown or commentary.
 
 Return this schema:
 {{
