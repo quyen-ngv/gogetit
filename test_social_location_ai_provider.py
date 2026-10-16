@@ -338,6 +338,69 @@ class SocialLocationAiProviderTest(unittest.TestCase):
         self.assertEqual("UNRESOLVED", result["candidates"][1]["resolutionStatus"])
         self.assertFalse(result["needs_confirmation"])
 
+    def test_caption_named_place_is_verified_for_music_only_video(self):
+        caption_candidate = {
+            "name": "Lỏi tươi farm",
+            "confidence": 0.9,
+            "identity_status": "CONFIRMED",
+            "mention_type": "CREATOR_CAPTION",
+            "inference_used": False,
+            "evidence": [{
+                "source": "caption_context",
+                "quote": "📍 Lỏi tươi farm",
+                "frame_index": None,
+                "supports_identity": True,
+            }],
+        }
+        invented = dict(caption_candidate, name="Đồi chè trái tim", evidence=[{
+            "source": "caption_context",
+            "quote": "Đồi chè trái tim",
+            "frame_index": None,
+            "supports_identity": True,
+        }])
+
+        result = extractor.retain_certain_candidates(
+            {"found": True, "candidates": [caption_candidate, invented]},
+            transcript="",
+            frame_count=10,
+            creator_text="Mộc Châu đã có hoa cải nở rực 📍 Lỏi tươi farm (Vé 50 cá/ng) Nông trường mộc châu",
+        )
+
+        self.assertEqual(
+            ["EVIDENCE_VERIFIED", "UNRESOLVED"],
+            [item["resolutionStatus"] for item in result["candidates"]],
+        )
+        self.assertEqual("ai_confirmed_caption", result["candidates"][0]["verification"]["evidenceMode"])
+
+    def test_tiktok_page_context_adds_caption_and_tagged_location(self):
+        item = {
+            "desc": "Mới tháng 10 thôi mà Mộc Châu đã có hoa cải 📍 Lỏi tươi farm (Vé 50 cá/ng)",
+            "poi": {
+                "name": "Nông trường mộc châu",
+                "address": "VMRVWG6, TT. NT Mộc Châu, Mộc Châu, Sơn La, Vietnam",
+                "city": "Mộc Châu town",
+                "province": "",
+                "ttTypeNameMedium": "Điểm du lịch",
+            },
+        }
+        metadata = {"caption": "Mới tháng 10", "webpage_url": "https://www.tiktok.com/@a/video/1"}
+
+        with patch.object(extractor, "_fetch_tiktok_item", return_value=item):
+            extractor.add_tiktok_page_context(metadata)
+
+        self.assertEqual(item["desc"], metadata["caption"])
+        self.assertEqual("Nông trường mộc châu", metadata["taggedLocation"]["name"])
+        self.assertIsNone(metadata["taggedLocation"]["province"])
+        self.assertIn("Sơn La", extractor._creator_text(metadata))
+
+    def test_tiktok_page_context_failure_keeps_metadata(self):
+        metadata = {"caption": "caption", "webpage_url": "https://www.tiktok.com/@a/video/1"}
+
+        with patch.object(extractor, "_fetch_tiktok_item", side_effect=RuntimeError("blocked")):
+            extractor.add_tiktok_page_context(metadata)
+
+        self.assertEqual({"caption": "caption", "webpage_url": "https://www.tiktok.com/@a/video/1"}, metadata)
+
     def test_repeated_or_accent_variants_remain_separate_source_mentions(self):
         evidence = [{
             "source": "audio",

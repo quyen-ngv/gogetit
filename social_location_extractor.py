@@ -65,13 +65,14 @@ _LOCAL_WHISPER_LOCK = threading.Lock()
 AI_GUARDRAIL_MIN_CONFIDENCE = 0.72
 MAP_MIN_MATCH_SCORE = 0.68
 MAP_AMBIGUITY_GAP = 0.08
-AI_CANDIDATE_POLICY = "AI_EVIDENCE_JUDGE_V2"
+AI_CANDIDATE_POLICY = "AI_EVIDENCE_JUDGE_V3"
 
 _AI_CONFIRMED_IDENTITY_STATUSES = {"confirmed"}
 _AI_SUPPORTED_MENTION_TYPES = {
     "explicit_audio_name",
     "exact_visible_sign",
     "multimodal_confirmed",
+    "creator_caption",
 }
 _EVIDENCE_SOURCES = {"audio", "frame", "slide", "caption_context"}
 
@@ -147,6 +148,76 @@ def _metadata_context(info: dict[str, Any]) -> dict[str, Any]:
         "duration": info.get("duration"),
         "webpage_url": info.get("webpage_url") or info.get("original_url") or "",
     }
+
+
+_TIKTOK_REHYDRATION_RE = re.compile(
+    r'<script[^>]+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>', re.S
+)
+
+
+def _fetch_tiktok_item(url: str) -> dict[str, Any]:
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/130.0 Safari/537.36"
+            ),
+            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    match = _TIKTOK_REHYDRATION_RE.search(response.text)
+    if not match:
+        return {}
+    data = json.loads(match.group(1))
+    detail = (data.get("__DEFAULT_SCOPE__") or {}).get("webapp.video-detail") or {}
+    item = (detail.get("itemInfo") or {}).get("itemStruct")
+    return item if isinstance(item, dict) else {}
+
+
+def add_tiktok_page_context(metadata: dict[str, Any], fallback_url: str = "") -> None:
+    """Add the full caption and the creator-tagged location (``poi``) from the TikTok page.
+
+    yt-dlp parses the same page but drops ``poi``, and the embed fallback only has the oEmbed
+    title. A music-and-scenery video often names its place nowhere else. Best effort: a blocked
+    or changed page leaves the metadata unchanged.
+    """
+    url = str(metadata.get("webpage_url") or fallback_url or "")
+    if "tiktok.com" not in url.lower():
+        return
+    try:
+        item = _fetch_tiktok_item(url)
+    except Exception as exc:
+        LOG.warning("TikTok page context unavailable: error=%s", _exception_summary(exc)[:300])
+        return
+    caption = _first_text(item.get("desc"))
+    if len(caption) > len(str(metadata.get("caption") or "")):
+        metadata["caption"] = caption
+    poi = item.get("poi")
+    if isinstance(poi, dict) and _first_text(poi.get("name")):
+        metadata["taggedLocation"] = {
+            "name": _first_text(poi.get("name")),
+            "address": _first_text(poi.get("address")) or None,
+            "city": _first_text(poi.get("city")) or None,
+            "province": _first_text(poi.get("province")) or None,
+            "category": _first_text(poi.get("ttTypeNameMedium") or poi.get("category")) or None,
+        }
+    LOG.info(
+        "TikTok page context: caption_chars=%s tagged_location=%r",
+        len(str(metadata.get("caption") or "")),
+        (metadata.get("taggedLocation") or {}).get("name"),
+    )
+
+
+def _creator_text(metadata: dict[str, Any]) -> str:
+    """Caption and tagged-location text that a CREATOR_CAPTION evidence quote must come from."""
+    tagged = metadata.get("taggedLocation") or {}
+    parts = [str(metadata.get("caption") or ""), str(metadata.get("title") or "")]
+    if isinstance(tagged, dict):
+        parts.extend(str(tagged.get(field) or "") for field in ("name", "address", "city"))
+    return " ".join(part for part in parts if part)
 
 
 def _yt_dlp_attempts() -> list[tuple[str, dict[str, Any]]]:
@@ -1389,6 +1460,7 @@ def _claude_extraction_tool_schema() -> dict[str, Any]:
                                     "EXPLICIT_AUDIO_NAME",
                                     "EXACT_VISIBLE_SIGN",
                                     "MULTIMODAL_CONFIRMED",
+                                    "CREATOR_CAPTION",
                                     "CONTEXTUAL_INFERENCE",
                                     "GENERIC_REFERENCE",
                                 ],
@@ -1504,6 +1576,7 @@ def _candidate_evidence_decision(
     *,
     transcript: str,
     frame_count: int | None,
+    creator_text: str = "",
 ) -> tuple[bool, str, str | None]:
     name = str(candidate.get("name") or "").strip()
     if not name:
@@ -1527,6 +1600,7 @@ def _candidate_evidence_decision(
 
     valid_audio = False
     valid_visual = False
+    valid_caption = False
     for evidence in candidate.get("evidence") or []:
         if not isinstance(evidence, dict) or not _as_bool(evidence.get("supports_identity")):
             continue
@@ -1534,6 +1608,8 @@ def _candidate_evidence_decision(
         quote = str(evidence.get("quote") or "").strip()
         if source == "audio" and quote and _fuzzy_quote_supported(transcript, quote):
             valid_audio = True
+        elif source == "caption_context" and quote and _fuzzy_quote_supported(creator_text, quote):
+            valid_caption = True
         elif source in {"frame", "slide"} and quote:
             try:
                 frame_index = int(evidence.get("frame_index"))
@@ -1548,6 +1624,8 @@ def _candidate_evidence_decision(
         return True, "accepted", "ai_confirmed_visual"
     if mention_type == "multimodal_confirmed" and valid_audio and valid_visual:
         return True, "accepted", "ai_confirmed_multimodal"
+    if mention_type == "creator_caption" and valid_caption:
+        return True, "accepted", "ai_confirmed_caption"
     return False, "evidence_guardrail_failed", None
 
 
@@ -1556,6 +1634,7 @@ def retain_certain_candidates(
     *,
     transcript: str,
     frame_count: int | None = None,
+    creator_text: str = "",
 ) -> dict[str, Any]:
     raw_candidates = extraction.get("candidates") or []
     accepted: list[dict[str, Any]] = []
@@ -1581,6 +1660,7 @@ def retain_certain_candidates(
             candidate,
             transcript=transcript,
             frame_count=frame_count,
+            creator_text=creator_text,
         )
         item = dict(candidate)
         item["confidence"] = _candidate_confidence(item)
@@ -2091,7 +2171,7 @@ def extract_candidates_with_ai(
         AI_CANDIDATE_POLICY,
     )
     context = {
-        "metadata_context_only_not_trusted": metadata,
+        "creator_metadata": metadata,
         "transcript_primary_evidence": transcript,
         "transcript_provider": transcript_provider,
         "image_count": len(image_paths),
@@ -2103,7 +2183,7 @@ def extract_candidates_with_ai(
     
     system_prompt = f"""
 You are a meticulous social-video place extraction engine for a travel application.
-Analyze the complete input (every transcript sentence and every supplied frame) before answering, and return one valid JSON object only.
+Analyze the complete input (every transcript sentence, every supplied frame, the caption and the tagged location) before answering, and return one valid JSON object only.
 You are the primary identity judge: the decision about which real place a mention refers to is yours, not a downstream string match.
 Reason silently in two passes: first inventory every possible place mention, then challenge each identity with all audio, visual, route and surrounding context.
 Return every distinct named place or concrete visit point the video presents as a useful travel spot; a named mention whose identity stays uncertain is kept as a candidate with an explicit unresolved verification state rather than dropped.
@@ -2127,7 +2207,10 @@ Extract real-world place candidates from this TikTok/Instagram travel or food vi
 - Subtitle lines burned into the frames are the creator's own words, usually spelled correctly: use them to fix speech-recognition errors.
 - Speech recognition garbles Vietnamese proper names ("tà sồa" for "Tà Xùa", "mỏng cá heo" for "Mỏm cá heo", "amê hyu" for "Army Hill"): write the correct name when subtitles, on-screen text or the well-known landmarks of the destination make it clear. That is correcting a transcription, not inferring a place.
 - A specific audio mention wins over generic scenery, food photos, interiors or weak visual guesses; ambiguous imagery adds no extra candidates.
-- Caption, title and tags are context only; a high-confidence candidate needs audio or visual evidence.
+- creator_metadata.caption is the creator's own description and creator_metadata.taggedLocation is the place the creator pinned to the post. A place the caption names explicitly (typically after "📍", "địa chỉ", "tại", "ở", or with its ticket price or opening hours) and the taggedLocation name are direct identity evidence: CREATOR_CAPTION, with a caption_context evidence entry quoting the caption text or the tagged name.
+- When the video is only music and scenery, without speech or readable on-screen text, the caption and taggedLocation are the identity source: list the places they name, never return nothing because audio and frames are silent.
+- The taggedLocation address and city fill address_hint, city_hint and query for the place the post is about. When the caption names a more specific spot inside the tagged area (a farm or cafe inside a town or plantation area), the caption spot is the candidate and the tag is its area context; the tagged area is a separate candidate only when it is presented as a distinct stop.
+- Hashtags, a bare city or province name, uploader names and sales lines (combos, room offers, "inbox"/"inb", booking contacts) carry no place identity.
 - Evidence for one place may be spread across nearby slides, frames and audio: use the full-video context to disambiguate it while quoting the evidence for that individual place.
 
 ## What is a candidate
@@ -2137,11 +2220,11 @@ Extract real-world place candidates from this TikTok/Instagram travel or food vi
 - When visual and audio identities conflict, or a branch stays ambiguous, keep the named mention with uncertainty_reason so downstream planning shows it as an ACTIVITY.
 - Every candidate carries at least one identity-supporting evidence entry quoting the actual transcript phrase or visible text as it appears.
 - CONFIRMED means the evidence establishes one specific identity and no similarly plausible alternative remains; confidence is calibrated judgment, not a substitute for evidence.
-- EXPLICIT_AUDIO_NAME tolerates minor transcript/OCR spelling differences when the spoken phrase semantically names the place. EXACT_VISIBLE_SIGN requires a readable identity-bearing sign or title and its 1-based supplied frame index. MULTIMODAL_CONFIRMED requires mutually supporting audio and visual identity evidence.
+- EXPLICIT_AUDIO_NAME tolerates minor transcript/OCR spelling differences when the spoken phrase semantically names the place. EXACT_VISIBLE_SIGN requires a readable identity-bearing sign or title and its 1-based supplied frame index. MULTIMODAL_CONFIRMED requires mutually supporting audio and visual identity evidence. CREATOR_CAPTION requires a caption_context evidence entry quoting the caption or taggedLocation text that names the place.
 - CONTEXTUAL_INFERENCE and GENERIC_REFERENCE belong in discarded_mentions, whatever the confidence. inference_used=true marks a name guessed from activity, geography, a nearby POI, search knowledge or outside knowledge; such an item is discarded.
 
 ## Completeness and order
-- Inspect the entire transcript and every supplied frame/slide before deciding the candidate list, then walk the transcript sentence by sentence and the frames in order: every named stop, numbered item, viewpoint, eatery, cafe, homestay or named experience ends up as a candidate or in discarded_mentions with a reason. If the video numbers its stops 1..N, all N are present.
+- Inspect the entire transcript and every supplied frame/slide before deciding the candidate list, then walk the transcript sentence by sentence, the frames in order and the caption line by line: every named stop, numbered item, viewpoint, eatery, cafe, homestay or named experience ends up as a candidate or in discarded_mentions with a reason. If the video numbers its stops 1..N, all N are present.
 - Never merge multiple explicitly named list items, branches, restaurants, attractions or stops into one candidate; listicle language, numbered slides, route stops and phrases such as "N places" mean several candidates.
 - The order in which points appear in the video is the highest-priority signal; explicit day/time is additional metadata, and popularity or map score changes no order.
 - "A or B", "choose one", "option 1/2" or alternatives presented at the same moment become one candidate per option with the same optionGroupId, increasing optionIndex and a relation such as "OPTION" or "SAME_TIME".
@@ -2150,7 +2233,7 @@ Extract real-world place candidates from this TikTok/Instagram travel or food vi
 
 ## Writing for the traveller (in {language})
 - Write every user-facing field (trip_title, trip_description, useful_summary, general_guidance, candidate description, useful_info, visit_guidance) the way a seasoned local planner writes a real trip plan: concrete, practical and warm, speaking directly to the traveller. Share what to do, see, eat or order there, the best time to go, prices, how to get there, what to bring or avoid, and the first-hand experience and recommendations voiced in the clip.
-- Every fact comes from the audio, visible text or frames; prices, opening hours, transport details, reservation needs and tips appear only when the input supports them. When the video gives little about a place, one short plain sentence is enough.
+- Every fact comes from the audio, visible text, frames or the caption; prices, opening hours, transport details, reservation needs and tips appear only when the input supports them. When the video gives little about a place, one short plain sentence is enough.
 - Never refer to the source in those fields: the words "video", "clip", "TikTok", "creator", "theo video", "trong video", "bạn ấy", "người quay" stay out, as does any remark about following or preserving an order. The caption, title and hashtags are not copied into user-facing fields.
 - trip_title: a short natural name for the trip (at most 60 characters) built from the destination, length and character of the plan, e.g. "Đà Lạt 3 ngày săn mây và cà phê đồi". Not the video's title.
 - trip_description: 2-4 sentences with the overall picture and the most useful practical advice from the video (when to go, how to get around, budget, pace, what to prepare).
@@ -2205,7 +2288,7 @@ Return this schema:
       "aliases": [string],
       "place_type_hint": string|null,
       "identity_status": "CONFIRMED"|"LIKELY"|"AMBIGUOUS",
-      "mention_type": "EXPLICIT_AUDIO_NAME"|"EXACT_VISIBLE_SIGN"|"MULTIMODAL_CONFIRMED"|"CONTEXTUAL_INFERENCE"|"GENERIC_REFERENCE",
+      "mention_type": "EXPLICIT_AUDIO_NAME"|"EXACT_VISIBLE_SIGN"|"MULTIMODAL_CONFIRMED"|"CREATOR_CAPTION"|"CONTEXTUAL_INFERENCE"|"GENERIC_REFERENCE",
       "inference_used": boolean,
       "uncertainty_reason": string|null,
       "evidence": [
@@ -2995,7 +3078,9 @@ def complete_carousel_extraction(
             "extraction": extraction,
             "error": {"code": "IRRELEVANT_SOCIAL_VIDEO", "message": reason},
         }
-    extraction = retain_certain_candidates(extraction, transcript="", frame_count=len(images))
+    extraction = retain_certain_candidates(
+        extraction, transcript="", frame_count=len(images), creator_text=_creator_text(metadata)
+    )
     candidates = extraction.get("candidates") or []
     if include_map_search and candidates:
         preview_images = build_candidate_preview_images(
@@ -3103,6 +3188,7 @@ def extract_social_location(
         if len(carousel_images) >= 2:
             carousel_info = extract_carousel_metadata(source_url)
             carousel_metadata = _metadata_context(carousel_info)
+            add_tiktok_page_context(carousel_metadata, source_url)
             carousel_metadata["mediaType"] = "IMAGE_CAROUSEL"
             carousel_metadata["imageCount"] = len(carousel_images)
             LOG.info("Processing image carousel without audio: images=%s", len(carousel_images))
@@ -3129,6 +3215,8 @@ def extract_social_location(
 
         info, _download_profile, media_path = fetch_video(source_url, temp_dir, max_duration_seconds, timings)
         metadata = _metadata_context(info)
+        with _timed(timings, "page_context"):
+            add_tiktok_page_context(metadata, source_url)
         duration = _positive_float(metadata.get("duration"))
         if media_path is None:
             return {
@@ -3332,6 +3420,7 @@ def extract_social_location(
             extraction,
             transcript=transcript,
             frame_count=len(frames),
+            creator_text=_creator_text(metadata),
         )
         candidates = extraction.get("candidates") or []
         if include_map_search and candidates:
